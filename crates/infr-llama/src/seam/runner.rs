@@ -13600,6 +13600,19 @@ fn generate_dense_backend_inner(
             dec_setup.as_secs_f64() * 1e3 / decode_n as f64,
             dec_exec.as_secs_f64() * 1e3 / decode_n as f64,
         );
+        // A forward submits in segments and waits for the queue to go idle after EVERY
+        // submission, so `submits/tok` x `gpu-wait` is the round-trip floor of a token. Compare
+        // it against `exec` above: the difference is what merging submissions could recover.
+        // (Cumulative counters, so run a short prompt to keep prefill out of the average.)
+        let (submits, barriers, gpu_ns) = infr_core::pager_profile::submit_snapshot();
+        tracing::info!(
+            "[submit prof] {:.1} submits/tok | {:.0} barriers/tok | {:.1} barriers/submit | gpu-wait {:.3}ms/tok vs exec {:.3}ms/tok",
+            submits as f64 / decode_n as f64,
+            barriers as f64 / decode_n as f64,
+            barriers as f64 / submits.max(1) as f64,
+            gpu_ns as f64 / 1e6 / decode_n as f64,
+            dec_exec.as_secs_f64() * 1e3 / decode_n as f64,
+        );
     }
     // Per-layer routed-expert histogram (INFR_MOE_ROUTING_TRACE=1); a no-op otherwise.
     infr_core::moe_trace::dump();

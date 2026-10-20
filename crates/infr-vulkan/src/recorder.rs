@@ -13888,6 +13888,13 @@ impl<'a> Recorder<'a> {
             self.free_transient();
             return Err(be(format!("queue_wait_idle: {e}")));
         }
+        // Submit accounting for the "where does a token's time go" question: one count per
+        // command buffer, its barrier total, and the GPU time that came back through the idle
+        // wait this submission performs.
+        pager_profile::record_submit(
+            *self.barriers.borrow(),
+            (self.t0.elapsed() - t_record).as_nanos() as u64,
+        );
         if self.stages {
             eprintln!(
                 "[prof] record={:.1}ms submit+gpu={:.1}ms",

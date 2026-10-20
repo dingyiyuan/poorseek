@@ -1984,3 +1984,27 @@ mod tests {
         assert_eq!(interval_intersection_duration(&a, &b), 14);
     }
 }
+
+/// Per-token submit accounting: how many command-buffer submissions a forward issues, how many
+/// pipeline barriers they carry, and how long each submission's GPU wait takes. The engine
+/// submits in segments and waits for the queue to go idle after EVERY submission, so this is the
+/// number that decides whether a forward is compute-bound or round-trip-bound.
+static SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
+static SUBMIT_BARRIERS: AtomicU64 = AtomicU64::new(0);
+static SUBMIT_GPU_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one command-buffer submission that waited for the queue to go idle.
+pub fn record_submit(barriers: usize, gpu_ns: u64) {
+    SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    SUBMIT_BARRIERS.fetch_add(barriers as u64, Ordering::Relaxed);
+    SUBMIT_GPU_NS.fetch_add(gpu_ns, Ordering::Relaxed);
+}
+
+/// `(submissions, barriers, gpu_ns)` accumulated so far.
+pub fn submit_snapshot() -> (u64, u64, u64) {
+    (
+        SUBMIT_COUNT.load(Ordering::Relaxed),
+        SUBMIT_BARRIERS.load(Ordering::Relaxed),
+        SUBMIT_GPU_NS.load(Ordering::Relaxed),
+    )
+}
