@@ -3414,9 +3414,12 @@ impl MappedMoeBlockIo {
                 .checked_mul(registration.n_expert)
                 .ok_or_else(|| anyhow!("mapped MoE expert bank size overflow"))?;
             let bank: &(dyn AsRef<[u8]> + Send + Sync) = &*source.bank;
-            if extent.len != expected || bank.as_ref().len() != expected {
+            // A virtual expert view (INFR_VIRTUAL_N_EXPERT < the on-disk count) registers only
+            // the first `n_expert` banks, while the file extent / mmap bank still span the full
+            // on-disk bank — so require AT LEAST the bytes this registration indexes.
+            if extent.len < expected || bank.as_ref().len() < expected {
                 return Err(anyhow!(
-                    "mapped MoE expert bank {} has file/mapping sizes {}/{}, expected {} x {} = {}",
+                    "mapped MoE expert bank {} has file/mapping sizes {}/{}, needs at least {} x {} = {}",
                     file.id,
                     extent.len,
                     bank.as_ref().len(),
@@ -3659,9 +3662,11 @@ fn register_bounded_moe_host_blocks(
             .stride_bytes
             .checked_mul(registration.n_expert)
             .ok_or_else(|| anyhow!("MoE bounded Host tier expert bank size overflow"))?;
-        if extent.len != expected {
+        // Virtual view: the file extent spans the full on-disk bank; only the first
+        // `n_expert` banks are registered below.
+        if extent.len < expected {
             return Err(anyhow!(
-                "MoE bounded Host tier expert bank {} is {} bytes, expected {} x {} = {}",
+                "MoE bounded Host tier expert bank {} is {} bytes, needs at least {} x {} = {}",
                 file.id,
                 extent.len,
                 registration.n_expert,
