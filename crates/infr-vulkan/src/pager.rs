@@ -2449,9 +2449,12 @@ impl MoePagerSession {
             .checked_mul(n_expert)
             .ok_or_else(|| be("moe pager: expert bank byte size overflow"))?;
         let bank_bytes = expert_bytes(&source.bank).len();
-        if bank_bytes != expected {
+        // A virtual expert view (`INFR_VIRTUAL_N_EXPERT`) registers only the first
+        // `n_expert` banks of an on-disk bank that still spans every expert, so require AT
+        // LEAST the indexed bytes — the stride math above already used the on-disk divisor.
+        if bank_bytes < expected {
             return Err(be(format!(
-                "moe pager: bank is {bank_bytes} bytes, expected {n_expert} x {} = {expected}",
+                "moe pager: bank is {bank_bytes} bytes, needs at least {n_expert} x {} = {expected}",
                 source.stride_bytes,
             )));
         }
@@ -2459,9 +2462,9 @@ impl MoePagerSession {
             .file
             .as_ref()
             .ok_or_else(|| be("moe pager: expert bank has no file descriptor"))?;
-        if file.nbytes() != expected {
+        if file.nbytes() < expected {
             return Err(be(format!(
-                "moe pager: bank file descriptor is {} bytes, expected {n_expert} x {} = {expected}",
+                "moe pager: bank file descriptor is {} bytes, needs at least {n_expert} x {} = {expected}",
                 file.nbytes(),
                 source.stride_bytes,
             )));

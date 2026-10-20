@@ -5294,9 +5294,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     infr_vulkan::pager::Role::Down => 2,
                 };
                 let block_base = (role_idx * n_paged * n_expert + l * n_expert) as u32;
+                // The host store holds only the VISIBLE slices, so the registered bank extent is
+                // the virtual slice (not the file range, which spans every on-disk expert).
                 let file = Some(infr_core::blockio::BlockDesc {
                     id: block_base,
-                    extents: vec![infr_core::blockio::BlockExtent { offset: base, len }],
+                    extents: vec![infr_core::blockio::BlockExtent {
+                        offset: base,
+                        len: stride_bytes * n_expert,
+                    }],
                 });
                 let source = infr_vulkan::pager::ExpertSource {
                     bank,
