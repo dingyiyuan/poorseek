@@ -125,6 +125,17 @@ pub struct Pager {
     /// dispatch batch while a pin lasts as long as the borrow — a CPU kernel reads a weight for a
     /// whole op, spanning batches.
     pinned: HashMap<BlockId, u32>,
+    /// Optional `BlockId -> layer` mapping for the per-layer quota policy. `None` (the default)
+    /// disables the policy outright; see [`Self::set_layer_share`].
+    layer_of: Option<Box<dyn Fn(BlockId) -> u32 + Send + Sync>>,
+    /// Slots one layer may hold before ITS OWN blocks become the preferred eviction victims.
+    /// `0` disables the policy: no counts are kept and every predicate/victim order below is the
+    /// exact pre-quota one.
+    layer_share: usize,
+    /// Currently resident block count per layer. Only populated while `layer_share != 0`, and
+    /// entries are dropped when they reach zero, so it stays bounded by the number of layers that
+    /// actually have residents rather than by every layer ever seen.
+    layer_counts: HashMap<u32, usize>,
     stats: PagerStats,
     profile_work: crate::pager_profile::LruWorkStats,
 }
@@ -183,9 +194,107 @@ impl Pager {
             cur_epoch: 0,
             cold_victim_cursor: None,
             pinned: HashMap::new(),
+            layer_of: None,
+            layer_share: 0,
+            layer_counts: HashMap::new(),
             stats: PagerStats::default(),
             profile_work: crate::pager_profile::LruWorkStats::default(),
         }
+    }
+
+    /// Arm the per-layer QUOTA eviction rule: one layer may hold at most `share` slots before its
+    /// own blocks become the preferred victims.
+    ///
+    /// # Why
+    /// A decode step sweeps layers `0..N` in order every token. Under one global LRU the head is
+    /// therefore always the layer touched EARLIEST in the current token — exactly the layer the
+    /// sweep is about to need again — so a miss later in the sweep evicts a hot expert of the
+    /// layer that is about to run (classic cyclic-scan thrash). With a quota, a miss first looks
+    /// for a victim in a layer that is already over its share, which keeps every layer's hot set
+    /// resident instead of letting the head layer churn.
+    ///
+    /// # Contract
+    /// - `layer_of` MUST be a pure function of the block id: residency bookkeeping derives
+    ///   `layer_counts` from it on every insert and removal, so a mapping that changes its answer
+    ///   under a stable id would desynchronise the counts.
+    /// - Call this ONCE, before the first `touch`: counts start empty, and only future inserts /
+    ///   removals maintain them. A mid-stream `share` change (or a mapping installed over an
+    ///   already-populated pager) is not supported.
+    /// - `share == 0` disables the policy and reproduces the pre-quota behaviour exactly: the
+    ///   mapping is stored but no counts are maintained and no victim order changes.
+    pub fn set_layer_share(
+        &mut self,
+        layer_of: Box<dyn Fn(BlockId) -> u32 + Send + Sync>,
+        share: usize,
+    ) {
+        self.layer_of = Some(layer_of);
+        self.layer_share = share;
+        self.layer_counts.clear();
+    }
+
+    /// The per-layer quota currently in force (`0` when the policy is off). A backend uses this to
+    /// log the quota it installed without reaching into the pager's internals.
+    pub fn layer_share(&self) -> usize {
+        self.layer_share
+    }
+
+    /// `true` when the quota rule is armed (mapping present and a non-zero share).
+    #[inline]
+    fn layer_quota_armed(&self) -> bool {
+        self.layer_share != 0 && self.layer_of.is_some()
+    }
+
+    /// Bump the resident count of `id`'s layer. No-op while the policy is disabled.
+    #[inline]
+    fn note_layer_insert(&mut self, id: BlockId) {
+        if self.layer_share == 0 {
+            return;
+        }
+        let Some(layer_of) = self.layer_of.as_deref() else {
+            return;
+        };
+        *self.layer_counts.entry(layer_of(id)).or_insert(0) += 1;
+    }
+
+    /// Drop the resident count of `id`'s layer, removing the entry at zero. No-op while the policy
+    /// is disabled — which is exactly why `layer_share == 0` costs nothing.
+    #[inline]
+    fn note_layer_remove(&mut self, id: BlockId) {
+        if self.layer_share == 0 {
+            return;
+        }
+        let Some(layer_of) = self.layer_of.as_deref() else {
+            return;
+        };
+        let layer = layer_of(id);
+        match self.layer_counts.get_mut(&layer) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                self.layer_counts.remove(&layer);
+            }
+            // Unreachable on the documented contract (mapping installed before the first insert
+            // and pure thereafter). Debug-only: a stale count must never become a runtime panic on
+            // a paging path that has no way to recover.
+            None => debug_assert!(false, "pager: layer count for block {id} went negative"),
+        }
+    }
+
+    /// `true` when `id`'s layer currently holds more than `layer_share` resident blocks — the
+    /// criterion that makes a block a PREFERRED victim.
+    #[inline]
+    fn over_layer_share(&self, id: BlockId) -> bool {
+        let Some(layer_of) = self.layer_of.as_deref() else {
+            return false;
+        };
+        self.layer_counts
+            .get(&layer_of(id))
+            .is_some_and(|&count| count > self.layer_share)
+    }
+
+    /// Whether ANY layer is over its share. A cheap `n_layers` check that keeps the common
+    /// quota-satisfied steady state on the exact pre-quota victim scan (one pass, first match).
+    fn any_layer_over_share(&self) -> bool {
+        self.layer_quota_armed() && self.layer_counts.values().any(|&count| count > self.layer_share)
     }
 
     /// Open a new touch batch (one dispatch's worth of `touch`/`touch_cold` calls). Blocks
@@ -313,6 +422,7 @@ impl Pager {
         }
         self.lru_tail = Some(slot);
         self.lru_len += 1;
+        self.note_layer_insert(id);
     }
 
     fn push_front_lru(&mut self, slot: u32, id: BlockId) {
@@ -334,12 +444,18 @@ impl Pager {
         }
         self.lru_head = Some(slot);
         self.lru_len += 1;
+        self.note_layer_insert(id);
     }
 
     fn unlink_lru(&mut self, slot: u32) -> Option<BlockId> {
         let idx = self.slot_idx(slot);
         let node = self.lru[idx];
         let id = node.id?;
+        // Every remove path (capacity victim, explicit evict, disable, replace_resident's old
+        // block, move-to-back's unlink half) funnels through here, so the per-layer count is
+        // maintained in exactly one place. `move_to_back_lru`/`replace_resident` emit an
+        // unlink+push pair: one decrement, one increment, net zero for the same block.
+        self.note_layer_remove(id);
         // MRU promotion or an external eviction can remove the next cold victim. Advance
         // before unlinking so a mixed touch/touch_cold batch cannot skip the remaining list.
         if self.cold_victim_cursor == Some(slot) {
@@ -392,6 +508,39 @@ impl Pager {
         (None, scan_steps)
     }
 
+    /// [`Self::first_lru_slot_matching`] with the per-layer quota rule layered on top: the
+    /// coldest EVICTABLE block whose layer is over its share wins; when no such block exists (or
+    /// the policy is off) the coldest evictable block anywhere does — i.e. exactly the pre-quota
+    /// victim choice. Either way it is ONE pass from the LRU head, so a caller's reported scan
+    /// length stays the true number of nodes inspected.
+    ///
+    /// `evictable` is the caller's existing predicate (batch-epoch / pin rules): the quota rule
+    /// only ever NARROWS the choice, it can never pick a protected block.
+    fn first_victim_slot<F>(&self, mut evictable: F) -> (Option<u32>, usize)
+    where
+        F: FnMut(BlockId) -> bool,
+    {
+        if !self.any_layer_over_share() {
+            return self.first_lru_slot_matching(evictable);
+        }
+        let mut scan_steps = 0usize;
+        let mut fallback = None;
+        let mut slot = self.lru_head;
+        while let Some(s) = slot {
+            let node = self.lru[self.slot_idx(s)];
+            let id = node.id.expect("linked LRU node has a block id");
+            scan_steps += 1;
+            if evictable(id) {
+                if self.over_layer_share(id) {
+                    return (Some(s), scan_steps);
+                }
+                fallback.get_or_insert(s);
+            }
+            slot = node.next;
+        }
+        (fallback, scan_steps)
+    }
+
     #[cfg(test)]
     fn lru_order(&self) -> Vec<BlockId> {
         let mut out = Vec::new();
@@ -427,6 +576,7 @@ impl Pager {
     /// paged in (caller must upload the block's bytes into `slot` and write the device LUT entry
     /// `id -> slot` before any dispatch reads it).
     pub fn touch(&mut self, id: BlockId) -> Resolution {
+        crate::moe_trace::record_block(id);
         self.epoch.insert(id, self.cur_epoch);
         if let Some(&slot) = self.resident.get(&id) {
             self.stats.hits += 1;
@@ -456,6 +606,7 @@ impl Pager {
     /// On a `Miss` the caller must fill the slot before reading it; on a `Hit` it is already valid.
     /// Either way the block comes back pinned exactly once.
     pub fn resolve_and_pin(&mut self, id: BlockId, insert: Insert) -> Option<Resolution> {
+        crate::moe_trace::record_block(id);
         if let Some(&slot) = self.resident.get(&id) {
             self.epoch.insert(id, self.cur_epoch);
             self.stats.hits += 1;
@@ -671,6 +822,7 @@ impl Pager {
     /// routed-only path) keep their hot set at the MRU end, out of the sweep's victim zone.
     /// Within-batch safety comes from the batch epoch (see [`Self::begin_batch`]), NOT ordering.
     pub fn touch_cold(&mut self, id: BlockId) -> Resolution {
+        crate::moe_trace::record_block(id);
         self.epoch.insert(id, self.cur_epoch);
         if let Some(&slot) = self.resident.get(&id) {
             self.stats.hits += 1;
@@ -719,22 +871,54 @@ impl Pager {
 
         let queue_len = self.lru_len;
         let mut scan_steps = 0usize;
+        // Quota-first scan of the UNEXAMINED suffix (from the cold cursor). The first
+        // current-epoch-unprotected block of a layer that is over its share wins. While the quota
+        // rule is armed the scan must NOT stop at the first merely-evictable block (a quota victim
+        // may sit further along), so that block is remembered as the fallback — precisely the node
+        // the pre-quota scan would have chosen.
+        //
+        // With the quota off (`quota == false`, the default) this is the ORIGINAL loop verbatim:
+        // stop at the first unprotected node, so every linked node is examined at most once per
+        // cold batch.
+        let quota = self.any_layer_over_share();
         let mut cursor = self.cold_victim_cursor;
-        let victim_slot = loop {
-            let Some(slot) = cursor else {
-                break None;
-            };
+        let mut fallback: Option<(u32, Option<u32>)> = None;
+        let mut preferred: Option<(u32, Option<u32>)> = None;
+        while let Some(slot) = cursor {
             let node = self.lru[self.slot_idx(slot)];
             let id = node.id.expect("linked LRU node has a block id");
             scan_steps += 1;
             cursor = node.next;
-            if self.epoch.get(&id) != Some(&self.cur_epoch) {
-                break Some(slot);
+            if self.epoch.get(&id) == Some(&self.cur_epoch) {
+                continue;
             }
-        };
-        // Advance before unlinking: `victim_slot`'s node is cleared by `unlink_lru`, while its
-        // saved successor remains linked and is exactly where the next cold miss must resume.
-        self.cold_victim_cursor = cursor;
+            if !quota || self.over_layer_share(id) {
+                preferred = Some((slot, cursor));
+                break;
+            }
+            fallback.get_or_insert((slot, cursor));
+        }
+        // The chosen victim's saved successor is where the next cold miss must resume. Record it
+        // BEFORE unlinking: `unlink_lru` clears the victim's node while that successor stays linked.
+        let mut victim_slot = preferred.or(fallback).map(|(slot, _)| slot);
+        self.cold_victim_cursor = preferred
+            .or(fallback)
+            .map(|(_, next)| next)
+            .unwrap_or(cursor);
+        if victim_slot.is_none() && quota {
+            // A quota-guided skip can leave EVICTABLE blocks behind the cursor: the pre-quota
+            // invariant "everything skipped is current-epoch protected" no longer holds, because a
+            // skipped node may simply be under its layer's share. Restart once from the cold head
+            // (it can only ever pick an unprotected block) and re-anchor the cursor after the
+            // victim, restoring that invariant for the rest of the batch.
+            let (behind, steps) =
+                self.first_lru_slot_matching(|b| self.epoch.get(&b) != Some(&self.cur_epoch));
+            scan_steps += steps;
+            if let Some(slot) = behind {
+                self.cold_victim_cursor = self.lru[self.slot_idx(slot)].next;
+                victim_slot = Some(slot);
+            }
+        }
         if crate::pager_profile::active() {
             self.profile_work
                 .record_victim_select(queue_len, scan_steps);
@@ -783,7 +967,9 @@ impl Pager {
         let epoch = &self.epoch;
         let pinned = &self.pinned;
         let queue_len = self.lru_len;
-        let (victim_slot, scan_steps) = self.first_lru_slot_matching(|b| {
+        // Quota-preferring scan (identical to the former `first_lru_slot_matching` when the
+        // policy is off or no layer is over its share).
+        let (victim_slot, scan_steps) = self.first_victim_slot(|b| {
             !(batches && epoch.get(&b) == Some(&cur_epoch)) && !pinned.contains_key(&b)
         });
         if crate::pager_profile::active() {
@@ -826,8 +1012,13 @@ impl Pager {
         let cur_epoch = self.cur_epoch;
         let epoch = &self.epoch;
         let queue_len = self.lru_len;
+        // Epoch 0 is the legacy no-batch mode, where NOTHING is current-batch protected: the
+        // historic predicate matched no block and the `lru_head` fallback in `unwrap_or_else`
+        // supplied the victim. Spell that out so the quota rule can still rank those blocks; the
+        // victim is the same LRU head it always was when the policy is off.
+        let no_batches = cur_epoch == 0;
         let (victim_slot, scan_steps) =
-            self.first_lru_slot_matching(|b| epoch.get(&b) != Some(&cur_epoch));
+            self.first_victim_slot(|b| no_batches || epoch.get(&b) != Some(&cur_epoch));
         if crate::pager_profile::active() {
             self.profile_work
                 .record_victim_select(queue_len, scan_steps);
@@ -1300,6 +1491,83 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The per-layer quota keeps a QUIET layer's hot expert resident while a sweeping layer churns
+    /// — the cyclic-scan failure the policy exists for. Layer 0 re-sweeps all 8 of its experts every
+    /// round; layer 1 only ever re-reads expert 8 (ids 8..16 are layer 1). Under one global LRU the
+    /// sweep walks through layer 1's block (it is the LRU head once layer 0's batch restarts), so
+    /// layer 1 re-misses every round. With `share = 2` the swept layer's own over-quota blocks are
+    /// the victims instead, and layer 1's block survives every sweep.
+    #[test]
+    fn layer_share_protects_a_quiet_layer_from_a_sweeping_one() {
+        // (stats, per-round count of rounds where layer 1's block survived the sweep, total rounds)
+        let run = |share: usize| {
+            let mut p = Pager::new(4);
+            if share != 0 {
+                p.set_layer_share(Box::new(|id| id / 8), share);
+            }
+            let mut survived_sweeps = 0;
+            let rounds = 8;
+            for _ in 0..rounds {
+                for expert in 0..8u32 {
+                    // One batch per expert: a batch may never be wider than the cache (the
+                    // within-batch safety floor), and this mirrors decode's per-layer batch.
+                    p.begin_batch();
+                    p.touch(expert);
+                }
+                if p.slot_of(8).is_some() {
+                    survived_sweeps += 1;
+                }
+                p.begin_batch();
+                p.touch(8);
+            }
+            (p.stats(), survived_sweeps, rounds)
+        };
+        let (quota, quota_survived, rounds) = run(2);
+        let (legacy, legacy_survived, _) = run(0);
+        assert_eq!(
+            quota.hits + quota.misses,
+            legacy.hits + legacy.misses,
+            "the access count must not depend on the eviction policy"
+        );
+        assert!(
+            quota.hits > legacy.hits,
+            "quota should spare layer 1's hot block: quota hits={} legacy hits={}",
+            quota.hits,
+            legacy.hits
+        );
+        // Round 0 runs before layer 1's block is ever admitted; every later sweep must keep it.
+        assert_eq!(
+            quota_survived,
+            rounds - 1,
+            "quota must keep layer 1's block resident across every sweep"
+        );
+        assert_eq!(
+            legacy_survived, 0,
+            "global LRU must lose layer 1's block inside layer 0's sweep"
+        );
+
+        // A quota that can never bind must be indistinguishable from the policy being off — this
+        // is the `layer_share == 0` (default) contract, spelled out against a live mapping.
+        let run_nonbinding = |share: usize| {
+            let mut p = Pager::new(4);
+            p.set_layer_share(Box::new(|id| id / 8), share);
+            for _ in 0..8 {
+                for expert in 0..8u32 {
+                    p.begin_batch();
+                    p.touch(expert);
+                }
+                p.begin_batch();
+                p.touch(8);
+            }
+            (p.stats().hits, p.stats().misses, p.stats().evictions, p.resident_slots_lru())
+        };
+        assert_eq!(
+            run_nonbinding(usize::MAX),
+            run_nonbinding(0),
+            "a non-binding share must leave victim choice (and the LRU) untouched"
+        );
     }
 
     #[test]

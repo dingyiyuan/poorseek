@@ -13601,6 +13601,8 @@ fn generate_dense_backend_inner(
             dec_exec.as_secs_f64() * 1e3 / decode_n as f64,
         );
     }
+    // Per-layer routed-expert histogram (INFR_MOE_ROUTING_TRACE=1); a no-op otherwise.
+    infr_core::moe_trace::dump();
     if let Some((before, timeline_before, layers_before)) = decode_profile_before {
         let after = infr_core::pager_profile::snapshot();
         let timeline = infr_core::pager_profile::device_timeline_snapshot();

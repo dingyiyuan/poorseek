@@ -78,6 +78,16 @@ fn validate_pager_dims(n_slots: usize, slot_bytes: usize) -> Result<()> {
     Ok(())
 }
 
+/// A/B switch for the per-layer expert-cache quota (`INFR_LAYER_SHARE`): on unless the variable is
+/// exactly `"0"`. An unrecognised value stays ON — this is a diagnostic escape hatch, not a parser.
+///
+/// It is read once per registered expert bank during model load (a few hundred reads at most,
+/// never on a dispatch path), so the process environment is the only input and no config field is
+/// needed for a knob that must be settable without touching a config file.
+fn layer_share_enabled() -> bool {
+    !matches!(std::env::var("INFR_LAYER_SHARE").as_deref(), Ok("0"))
+}
+
 /// Apply one LUT-mirror placement to `lut_host`: clear an evicted block's entry to `NOT_RESIDENT`,
 /// then record the newly-resident block's SLOT INDEX. Pure over the mirror slice (no `lut_dirty`,
 /// no GPU) so the eviction/insert bookkeeping — the one place a wrong LUT entry becomes silent-zero
@@ -2470,6 +2480,48 @@ impl MoePagerSession {
             )));
         }
         let block_base = (role.index() * self.role_stride) as u32 + source.layer_base;
+        // Per-layer expert-cache quota (`INFR_LAYER_SHARE`, on by default). Decode sweeps layers
+        // 0..n_paged in order every token, so under one global LRU the eviction head is always the
+        // layer touched earliest in the current token — the one the sweep needs next. Cap how many
+        // slots one layer may hold at `enabled_slots / n_paged_layers` (>= 1) and let a miss prefer
+        // a victim from an over-quota layer; `set_layer_share`'s doc has the full rationale, and a
+        // non-binding share is a no-op, so this is safe for models where the cache already holds
+        // every expert.
+        //
+        // Id space (see `register`'s `block_base` above and `MoePagerSession::role_stride`):
+        // `id = role.index() * role_stride + layer * n_expert + local`, with
+        // `role_stride = n_paged_layers * n_expert`, so `(id % role_stride) / n_expert` is the
+        // layer and every role of one layer shares one quota.
+        if layer_share_enabled() {
+            let n_layers = (n_expert != 0 && self.role_stride % n_expert == 0)
+                .then(|| self.role_stride / n_expert)
+                .filter(|&layers| layers > 0)
+                // Unreachable with the seam's layout (`n_blocks = n_paged_layers * n_expert`).
+                // 40 is this model's N=80 view (DeepSeek-V4.1: 40 paged layers x 80 experts).
+                .unwrap_or(40);
+            let pager = &mut self.pools[pool].pager;
+            let share = (pager.enabled_slots() / n_layers).max(1);
+            let role_stride = self.role_stride as u32;
+            let experts_per_layer = n_expert as u32;
+            // One line per pool: the pool may serve several roles (gate/up share a size class), so
+            // only the FIRST registration that arms it reports the quota.
+            let first_arm = pager.pager.layer_share() == 0 && source.layer_base == 0;
+            pager.pager.set_layer_share(
+                Box::new(move |id| (id % role_stride) / experts_per_layer),
+                share,
+            );
+            if first_arm {
+                tracing::info!(
+                    "[infr] moe pager layer quota: {} of {} enabled slots per layer \
+                     (layers={} role_stride={} n_expert={})",
+                    share,
+                    pager.enabled_slots(),
+                    n_layers,
+                    role_stride,
+                    experts_per_layer,
+                );
+            }
+        }
         let (host_chunk, chunk_offset) = if let Some(host) = &self.pools[pool].host {
             for expert in 0..n_expert as u32 {
                 let id = block_base + expert;
