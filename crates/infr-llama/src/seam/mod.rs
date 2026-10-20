@@ -2797,6 +2797,9 @@ fn moe_logical_pools(g: &Gguf, cfg: &Config, n_paged: usize) -> Vec<(usize, usiz
         return Vec::new();
     };
     let n_expert = moe.n_expert.max(1);
+    // On-disk stride, independent of the virtual view: a narrowed bank still holds every
+    // expert, so the per-expert slot byte count divides by the real count.
+    let real_n_expert = moe.real_n_expert.max(n_expert);
     let mut by_size = std::collections::BTreeMap::<usize, (usize, [usize; 3])>::new();
     for t in g.tensors() {
         let Some(_layer) = moe_expert_layer(&t.name).filter(|&l| l < n_paged) else {
@@ -2805,7 +2808,7 @@ fn moe_logical_pools(g: &Gguf, cfg: &Config, n_paged: usize) -> Vec<(usize, usiz
         let Some(role) = moe_role_index(&t.name) else {
             continue;
         };
-        let slot_bytes = (t.nbytes / n_expert).max(4);
+        let slot_bytes = (t.nbytes / real_n_expert).max(4);
         let entry = by_size.entry(slot_bytes).or_insert((0, [0; 3]));
         entry.0 += n_expert;
         entry.1[role] += n_expert;
@@ -7585,6 +7588,7 @@ mod seam_helper_tests {
             ssm_d_state: 128,
             moe: Some(crate::MoeConfig {
                 n_expert: 512,
+                real_n_expert: 512,
                 n_used: 10,
                 n_ff_exp: 640,
                 scale: 1.0,
@@ -8222,6 +8226,7 @@ mod seam_helper_tests {
             ssm_d_conv: 4,
             moe: Some(crate::MoeConfig {
                 n_expert: 512,
+                real_n_expert: 512,
                 n_used: 8,
                 n_ff_exp: 768,
                 scale: 1.0,
@@ -8315,6 +8320,7 @@ mod seam_helper_tests {
         let mut moe_cfg = cfg.clone();
         moe_cfg.moe = Some(crate::MoeConfig {
             n_expert: 256,
+            real_n_expert: 256,
             n_used: 8,
             n_ff_exp: 512,
             scale: 1.0,

@@ -1585,9 +1585,22 @@ impl Config {
             || bailingmoe3
             || glm5next
         {
-            let n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
+            let real_n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
             let n_used =
                 meta_u64(g, &mk("expert_used_count")).context("expert_used_count")? as usize;
+            // Optional smoke-test view: shrink the ROUTER-visible expert count without touching
+            // the GGUF (e.g. INFR_VIRTUAL_N_EXPERT=80 → only the first 80 banks per layer are
+            // materialised and routed). The on-disk stride still uses `real_n_expert`.
+            let n_expert = std::env::var("INFR_VIRTUAL_N_EXPERT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&v| v > 0 && v <= real_n_expert)
+                .unwrap_or(real_n_expert);
+            if n_expert < n_used {
+                bail!(
+                    "{arch}: INFR_VIRTUAL_N_EXPERT={n_expert} is below top-k n_used={n_used}"
+                );
+            }
             let n_ff_exp = meta_u64(g, &mk("expert_feed_forward_length"))
                 .map(|v| v as usize)
                 .unwrap_or(n_ff / n_used.max(1));
@@ -1637,6 +1650,7 @@ impl Config {
             };
             Some(MoeConfig {
                 n_expert,
+                real_n_expert,
                 n_used,
                 n_ff_exp,
                 scale,

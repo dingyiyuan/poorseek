@@ -13742,6 +13742,7 @@ mod tests {
             hc_mult: 4,
             moe: Some(crate::MoeConfig {
                 n_expert: 512,
+                real_n_expert: 512,
                 n_used: 10,
                 n_ff_exp: 640,
                 scale: 1.,
@@ -13829,6 +13830,7 @@ mod tests {
             shexp_ff: 512,
             moe: Some(crate::MoeConfig {
                 n_expert: 256,
+                real_n_expert: 256,
                 n_used: 8,
                 n_ff_exp: 512,
                 scale: 1.,
@@ -13984,6 +13986,7 @@ mod tests {
         let cfg = crate::Config {
             moe: Some(crate::MoeConfig {
                 n_expert: 512,
+                real_n_expert: 512,
                 n_used: 10,
                 n_ff_exp: 640,
                 scale: 1.0,

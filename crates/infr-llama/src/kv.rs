@@ -7,7 +7,12 @@
 /// (qwen3moe/qwen35moe/diffusion-gemma) and llama4's sigmoid top-1.
 #[derive(Clone, Copy, Debug)]
 pub struct MoeConfig {
+    /// Expert count the ROUTER sees. Equals the on-disk bank count unless an
+    /// `INFR_VIRTUAL_N_EXPERT` view narrows it (a smoke-test model shrink).
     pub n_expert: usize,
+    /// On-disk (GGUF) expert bank count — the stride divisor for slot/pool math. Always >=
+    /// `n_expert`; the pager only materialises the first `n_expert` banks of each layer.
+    pub real_n_expert: usize,
     pub n_used: usize,
     pub n_ff_exp: usize,
     pub scale: f32,
