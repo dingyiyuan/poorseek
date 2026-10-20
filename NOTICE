@@ -6,3 +6,12 @@ Maintained by Headmaster218.
 This product includes software originally developed by kryptic.sh and
 distributed under the MIT License. The original copyright and license notice
 are preserved in LICENSE-MIT.
+
+poorseek forks infr / MoE4All (https://github.com/Headmaster218/MoE4All) and
+thanks the following upstream work:
+  - MoE4All (infr): pager / slot / LUT / host-tier substrate, DSV4.1 loader.
+  - Strata: hot/cold expert paging (expert_cache, expert_source, host-tier
+    complement) and adaptive tier design.
+  - llama.cpp: GGUF format, quant kernels, MoE routing (n_expert_used), and
+    the deepseek41.cpp reference implementation.
+  - DeepSeek: DeepSeek-V4.1-Flash model and CED architecture.

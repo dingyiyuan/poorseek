@@ -4,6 +4,17 @@
 > 后 20 层集中 → 常驻显存；前 20 层离散 → 溢出走 host_dma BDA 直读 / CPU 兜底；温带专家固定 + 低频轮换。
 > 复用 MoE4All 的通用分页/Slot/LUT/host-tier 底层，改造的是策略层（分层预算、温带选择、轮换、CPU pinned 池）。
 
+## 致谢 / Acknowledgements
+
+poorseek 站在巨人的肩膀上，没有这些前辈就没有本项目：
+
+- **[MoE4All](https://github.com/Headmaster218/MoE4All)**（infr）— 本项目的直接上游。通用分页 / Slot / LUT / host-tier 底层、DSV4.1 模型加载与内核框架均来自它。其 CPU 冷专家与 MTP 模块又源自 Strata。
+- **Strata** — 冷热专家分页（`expert_cache` / `expert_source` / host-tier 补集）与 adaptive tier 的原始设计，MoE4All 的分页思路承自它。
+- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** — GGUF 格式、量化内核（Q2_K/Q4_K/…）、MoE 调度（`n_expert_used`）以及 `deepseek41.cpp` 参考实现的基础。没有 llama.cpp，就没有能跑起 DeepSeek 的任何路径。
+- **[DeepSeek](https://github.com/deepseek-ai)** — DeepSeek-V4.1-Flash 模型与 CED（Causal Encoder-Decoder）架构。
+
+（若有遗漏，欢迎 PR 补上——这是社区的作品。）
+
 **让游戏显卡跑起远超显存容量的大模型。AMD、NVIDIA、Intel，均已跑通。**
 
 Windows、Linux 免安装，约 17 MiB 即下即用；Apple Silicon 同步提供实验性 Metal 发行包。选择推荐的模型或自备模型，自动配置参数，即可立即开始聊天，
