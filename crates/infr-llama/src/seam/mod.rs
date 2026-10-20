@@ -2876,6 +2876,11 @@ pub(crate) fn moe_prefill_floor_bytes(g: &Gguf, cfg: &Config) -> u64 {
 /// size classes into the Decode dispatch floor.
 fn moe_prefill_min_lane_bytes(g: &Gguf, cfg: &Config) -> u64 {
     let mut role_max = [0u64; 3];
+    let (n_view, n_disk) = cfg
+        .moe
+        .as_ref()
+        .map(|m| (m.n_expert.max(1), m.real_n_expert.max(m.n_expert.max(1))))
+        .unwrap_or((1, 1));
     for tensor in g.tensors() {
         let Some(_layer) = moe_expert_layer(&tensor.name).filter(|&layer| layer < cfg.n_layer)
         else {
@@ -2884,7 +2889,13 @@ fn moe_prefill_min_lane_bytes(g: &Gguf, cfg: &Config) -> u64 {
         let Some(role) = moe_role_index(&tensor.name) else {
             continue;
         };
-        role_max[role] = role_max[role].max(tensor.nbytes as u64);
+        // Price the VISIBLE bank, not the on-disk one: under `INFR_VIRTUAL_N_EXPERT` the pager
+        // only ever materialises the first `n_expert` slices, so a lane costs
+        // `(nbytes / real_n_expert) * n_expert` — pricing the full 384-slice bank would shrink
+        // the prefill chunk for no reason.
+        role_max[role] = role_max[role].max(
+            (tensor.nbytes as u64 / n_disk as u64) * n_view as u64,
+        );
     }
     role_max
         .into_iter()
@@ -4025,7 +4036,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
     if first_load && n_paged > 0 {
         use infr_vulkan::pager::Role;
         let moe = cfg.moe.as_ref().expect("n_paged > 0 implies MoE");
+        // Router-visible VIEW vs on-disk bank. They differ only under `INFR_VIRTUAL_N_EXPERT`:
+        // the file still holds every expert, while the pager materialises the first `n_expert`
+        // banks and routing only ever names those. Counts / the pager's global block-id space
+        // use the view; per-expert STRIDE math uses the on-disk count.
         let n_expert = moe.n_expert.max(1);
+        let real_n_expert = moe.real_n_expert.max(n_expert);
         // MoE runtime weights DMA directly from one permanent HOST_CACHED transfer source; no
         // upload ring or host pager is allocated for this path.
         // Enumerate every paged `_exps` bank's role and per-expert byte size. The role remains
@@ -4040,8 +4056,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let Some(role) = moe_role_of(&t.name) else {
                 continue; // `_exps` but not a weight bank (e.g. the per-expert `.scale` vector)
             };
-            let sb = (t.nbytes / n_expert).max(4);
-            host_banks.push((layer, role, t.nbytes));
+            // One per-expert slice is the ADDRESSING unit (`arena + expert * stride`), so its
+            // size divides by the ON-DISK bank count — a virtual view narrows the bank, never
+            // the stride.
+            let sb = (t.nbytes / real_n_expert).max(4);
+            // The permanent host store only needs the virtual slice: experts
+            // `[n_expert, real_n_expert)` are never named by the router and never paged.
+            host_banks.push((layer, role, sb * n_expert));
             match pool_blocks
                 .iter_mut()
                 .find(|(r, s, _)| *r == role && *s == sb)
@@ -5235,17 +5256,19 @@ pub(crate) fn vulkan_moe_binder<'a>(
         }
         if let Some(l) = exps_layer(name).filter(|&l| l < n_paged) {
             if let (WBytes::Mmap(bytes), Some(role)) = (&tb, moe_role_of(name)) {
-                let n_expert = cfg
+                let mc = cfg
                     .moe
                     .as_ref()
-                    .expect("a paged tensor implies an MoE config")
-                    .n_expert
-                    .max(1);
+                    .expect("a paged tensor implies an MoE config");
+                let n_expert = mc.n_expert.max(1);
+                // The on-disk count is the stride divisor; `n_expert` (the router-visible view)
+                // stays the block-id space and the registered bank count.
+                let real_n_expert = mc.real_n_expert.max(n_expert);
                 // The ADDRESSING UNIT of a stacked bank is ONE per-expert slice, not the whole
                 // bank (the arena kernels index `arena + expert * stride`), so the whole-bank
                 // element count may legitimately exceed 2^32 while each slice must not.
-                check_bda_element_cap(name, "per-expert slice", numel / n_expert)?;
-                let stride_bytes = bytes.len() / n_expert;
+                check_bda_element_cap(name, "per-expert slice", numel / real_n_expert)?;
+                let stride_bytes = bytes.len() / real_n_expert;
                 let placeholder = vk
                     .alloc_uninit(4, BufferUsage::Weights)
                     .map_err(|e| anyhow!("{e}"))?;
@@ -5257,10 +5280,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     anyhow!("MoE permanent host-store plan has no offset for {name}")
                 })?;
                 let (base, len) = bytes.file_range();
-                if len != stride_bytes * n_expert {
+                // The file extent spans the WHOLE on-disk bank; a virtual view registers only
+                // the first `n_expert` of them, so require at least those bytes.
+                if len < stride_bytes * real_n_expert {
                     return Err(anyhow!(
-                        "MoE Host tier: {name}'s file range is {len} bytes, expected \
-                         {n_expert} x {stride_bytes}"
+                        "MoE Host tier: {name}'s file range is {len} bytes, needs at least \
+                         {real_n_expert} x {stride_bytes}"
                     ));
                 }
                 let role_idx = match role {
@@ -5300,13 +5325,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // are gone (weights are u64 BDA-addressed only), so the slice cap is now correct. Every
         // non-expert weight is still one whole-tensor addressing unit.
         if moe_role_of(name).is_some() {
-            let n_expert = cfg
+            let mc = cfg
                 .moe
                 .as_ref()
-                .expect("an expert-bank tensor implies an MoE config")
-                .n_expert
-                .max(1);
-            check_bda_element_cap(name, "per-expert slice", numel / n_expert)?;
+                .expect("an expert-bank tensor implies an MoE config");
+            // Element cap on ONE per-expert slice — the on-disk slice, not the virtual view's.
+            let real_n_expert = mc.real_n_expert.max(mc.n_expert.max(1));
+            check_bda_element_cap(name, "per-expert slice", numel / real_n_expert)?;
         } else if chunk_covered_dense_tensor(name) {
             // lm_head / embedding tables (issue #77): read ONLY by chunk-covered dispatches (the
             // output projection's decode GEMV + Op::EmbedGather), which split a >= 2^32-element
@@ -5779,25 +5804,32 @@ fn expert_parallel_binder<'a>(
 ) -> Box<BindWeight<'a>> {
     let world = ep.world();
     let n_expert = cfg.moe.as_ref().map(|m| m.n_expert).unwrap_or(0).max(1);
+    // Stride divisor is the ON-DISK bank count: a virtual view narrows the routed bank, the
+    // per-expert slice keeps its on-disk size.
+    let real_n_expert = cfg
+        .moe
+        .as_ref()
+        .map(|m| m.real_n_expert.max(m.n_expert.max(1)))
+        .unwrap_or(1);
     Box::new(move |name: &str, tb: WBytes, dt: DType, numel: usize| {
         if is_expert_bank(name) {
             // Split the bank by expert. The stacked bank is `n_expert` contiguous per-expert slices
             // (the arena kernels index `arena + expert·stride`), so band `[r·nl, (r+1)·nl)` is a
             // contiguous byte range and its per-expert element cap is `numel/n_expert`.
             let total = tb.len();
-            if !total.is_multiple_of(n_expert) {
+            if !total.is_multiple_of(real_n_expert) {
                 return Err(anyhow!(
-                    "ep: expert bank '{name}' {total} bytes not divisible by n_expert={n_expert}"
+                    "ep: expert bank '{name}' {total} bytes not divisible by real_n_expert={real_n_expert}"
                 ));
             }
-            let stride_bytes = total / n_expert;
+            let stride_bytes = total / real_n_expert;
             if !n_expert.is_multiple_of(world) {
                 return Err(anyhow!(
                     "ep: n_expert={n_expert} not divisible by world {world}"
                 ));
             }
             let nl = n_expert / world;
-            check_bda_element_cap(name, "per-expert slice", numel / n_expert)?;
+            check_bda_element_cap(name, "per-expert slice", numel / real_n_expert)?;
             // Each rank uploads its own band of the bank, so the bytes are needed here.
             let tb = tb.materialize();
             let mut bufs = Vec::with_capacity(world);
