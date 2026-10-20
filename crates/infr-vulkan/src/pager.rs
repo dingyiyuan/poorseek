@@ -3591,6 +3591,13 @@ impl MoePagerSession {
             let slots = self.pools[*pool]
                 .pager
                 .lut_words(src.block_base as usize, n_expert);
+            // Routing histogram (INFR_MOE_ROUTING_TRACE=1). This all-resident fast path reads
+            // the LUT directly instead of going through `Pager::touch`, so it is sampled here.
+            // Every role (gate/up/down) records the same ids, which scales every layer's counts
+            // equally and therefore leaves the ratios (HHI, top-N coverage) untouched.
+            for &id in ids {
+                infr_core::moe_trace::record_block(src.block_base + id);
+            }
             if ids.iter().any(|&id| {
                 slots
                     .get(id as usize)
