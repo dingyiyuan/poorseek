@@ -6,6 +6,14 @@ use infr_core::loader::MetaValue;
 use infr_core::WeightSource;
 use infr_gguf::Gguf;
 
+/// DeepSeek-V4.1 CED split: the prefill scheduler hardcodes the 20-layer causal encoder /
+/// 20-layer decoder boundary. NOT read from the GGUF — the split is a scheduling policy, not a
+/// weight attribute, and hardcoding keeps the file export-compatible with the official
+/// `.safetensors`. [`Config::from_gguf`] guards this against the actual geometry (see the
+/// `deepseek41` source-map block), so a different CED variant (or the official loader) fails
+/// loudly instead of silently computing the wrong layers.
+pub const DSV41_ENCODER_LAYERS: usize = 20;
+
 /// `Default` is an ALL-ZERO placeholder, not a runnable model: [`Config::from_gguf`] is the only
 /// source of a real one. It exists so a test can name the two or three fields the arithmetic it is
 /// checking actually reads (`Config { n_layer: 48, n_kv: 8, ..Default::default() }`) instead of
@@ -1279,6 +1287,33 @@ impl Config {
                         compress_ratios[il]
                     );
                 }
+            }
+            // CED guard. The prefill scheduler splits at `DSV41_ENCODER_LAYERS` (hardcoded
+            // 20/20). Fail loudly — never silently compute the wrong layers — when the file's
+            // geometry or KV-source layout does not match that split. The source layout is the
+            // tensor signature of CED: `attn_compressor_kv` exists only on the ratio-1 source at
+            // layer 20, so `kv[20] == 20` proves the decoder's KV is projected from the encoder's
+            // final hidden state. A future CED variant (or the official .safetensors loader) that
+            // disagrees must hit this bail rather than run with 20 hardcoded.
+            if n_layer != 2 * DSV41_ENCODER_LAYERS {
+                bail!(
+                    "deepseek41 CED: expected {} layers (2 × {} hardcoded encoder/decoder split), \
+                     found {n_layer}. The CED prefill scheduler only supports the 20/20 split; \
+                     update DSV41_ENCODER_LAYERS for a different CED variant.",
+                    2 * DSV41_ENCODER_LAYERS,
+                    DSV41_ENCODER_LAYERS,
+                );
+            }
+            if kv[DSV41_ENCODER_LAYERS] != DSV41_ENCODER_LAYERS as i32 {
+                bail!(
+                    "deepseek41 CED: layer {} is not its own KV source (dsv41_kv_source[{}] = {}). \
+                     The file's compressed-attention source map does not match the 20/20 CED \
+                     layout (expected attn_compressor_kv on the ratio-1 decoder source at layer {}).",
+                    DSV41_ENCODER_LAYERS,
+                    DSV41_ENCODER_LAYERS,
+                    kv[DSV41_ENCODER_LAYERS],
+                    DSV41_ENCODER_LAYERS,
+                );
             }
             (kv, key, topk)
         } else {
