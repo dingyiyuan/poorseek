@@ -1,0 +1,108 @@
+# tools/xolotl/ggml/xolotl-sycl-topk.patch - S3b fix: ggml-sycl's scan/merge top_k left -1 in its output.
+#
+# WHAT: top_k_scan_merge_f32 (ggml-sycl.cpp) now tracks how many slots the running list has actually filled, in both
+# the per-lane scan and the single-thread merge, and admits every candidate while that count is below k. The k-th-best
+# threshold only rejects once the list is full. Empty slots keep the existing -FLT_MAX / -1 tombstone.
+#
+# WHY: the only admission test was "val > kth", seeded at kth = -FLT_MAX. A score of -inf (a masked entry: top_k over
+# a row holding -inf is a legal, used call - e.g. an indexer that masks the rows a query may not attend to) is never
+# greater than -FLT_MAX, so those candidates were never inserted and their slots kept the li = -1 initialiser. -1 is
+# not a row index: a caller that gathers with the returned ids reads one row before its buffer and gets whatever is
+# there. ggml-cpu's top_k (partial_sort over all ne00) and ggml-cuda's top_k both return valid ids for -inf entries,
+# so the SYCL body was the odd one out. This kernel path is taken for k <= SYCL_TOP_K_SCAN_MERGE_MAX_K (8), and it
+# only misbehaves when the row supplies fewer than k scores above -FLT_MAX; a normal vocabulary top_k (k << n, no
+# -inf) never manufactured the case, which is why the sentinel went unnoticed.
+#
+# Visible on the hardware here (Arc Pro B70, oneAPI 2026.2, Level Zero) with ggml_top_k, k == ne0 == 8, over a row
+# containing -inf: SYCL returned 3-8 slots as -1, CPU a permutation of 0..7. After the patch both return the same id
+# set; rows without -inf are bit-identical to before (verified on the kernel and end to end). With k < ne0 and a cut
+# that ties at -inf, which tied -inf index is selected is unspecified on every backend (ggml's own
+# tests/test-backend-ops.cpp test_top_k_inf compares the selected values for that reason); the selected score
+# multiset now matches partial_sort. See docs/xolotl-sycl-s3b-topk-report.md.
+#
+# APPLY: git -C <llama.cpp> apply tools/xolotl/ggml/xolotl-sycl-topk.patch
+# Upstream context: ggml/src/ggml-sycl/ggml-sycl.cpp of llama.cpp a0e6dc7384edb8f5d927155e1d26c10b4a310e6d (the tree
+# used for the SYCL build; the hunk's context is unchanged since the pin 3cf03257).  Build: GGML_SYCL=ON, oneAPI
+# 2026.2.  Nothing here is model-specific.
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -2725,11 +2725,18 @@
+     // majority of elements scanned, and in that case touches no memory.
+     float kth = -FLT_MAX;
+ 
++    // Slots actually taken. -FLT_MAX is the empty-slot tombstone and -inf is a real
++    // score (a masked entry: top_k over a row holding -inf is a legal call, e.g. an
++    // indexer's masked score row), and -inf > -FLT_MAX is false, so a threshold test
++    // alone would reject every -inf forever and leave those slots at -1. Until the
++    // list is full every candidate is admissible; only then does kth decide.
++    int filled = 0;
++
+     for (int col = begin + tid; col < end; col += block_size) {
+         float val = src_vals[col];
+ 
+-        if (val > kth) {
+-            int pos = k - 1;
++        if (filled < k || val > kth) {
++            int pos = filled < k ? filled : k - 1;
+             while (pos > 0 && val > lv[(pos - 1) * block_size]) {
+                 pos--;
+             }
+@@ -2741,6 +2748,9 @@
+             lv[pos * block_size] = val;
+             li[pos * block_size] = src_map ? src_map[col] : col;
+ 
++            if (filled < k) {
++                filled++;
++            }
+             kth = lv[(k - 1) * block_size];
+         }
+     }
+@@ -2761,14 +2771,26 @@
+     }
+ 
+     float fkth = -FLT_MAX;
++    int ffilled = 0;
+ 
+     // Candidates are visited in the same (t, i) order as before, so tie-breaking is
+     // unchanged.
+     for (int t = 0; t < block_size; t++) {
+         for (int i = 0; i < k; i++) {
++            int idx = shared_idx[i * block_size + t];
++
++            // -1 is a slot lane t never filled (a lane that saw no column at all, or the
++            // tail of one that saw fewer than k). Lane lists are sorted with the valid
++            // entries first, so the rest of this lane can be skipped.
++            if (idx < 0) {
++                break;
++            }
++
+             float val = shared_vals[i * block_size + t];
+ 
+-            if (val <= fkth) {
++            // Same admission rule as the scan above: -inf is a real score, so only a full
++            // list may reject a candidate.
++            if (ffilled == k && val <= fkth) {
+                 // Lane t's list is sorted descending, so once one of its entries loses
+                 // to the k-th best, every later entry loses too. fkth only rises, so
+                 // that stays true for the rest of the merge. This turns the merge from
+@@ -2777,9 +2799,7 @@
+                 break;
+             }
+ 
+-            int idx = shared_idx[i * block_size + t];
+-
+-            int pos = k - 1;
++            int pos = ffilled < k ? ffilled : k - 1;
+             while (pos > 0 && val > fv[pos - 1]) {
+                 pos--;
+             }
+@@ -2791,6 +2811,9 @@
+             fv[pos] = val;
+             fi[pos] = idx;
+ 
++            if (ffilled < k) {
++                ffilled++;
++            }
+             fkth = fv[k - 1];
+         }
+     }

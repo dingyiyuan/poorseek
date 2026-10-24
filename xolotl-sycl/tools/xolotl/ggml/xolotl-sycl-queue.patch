@@ -1,0 +1,52 @@
+# tools/xolotl/ggml/xolotl-sycl-queue.patch - S2 of docs/xolotl-sycl-port-plan.md.
+#
+# WHAT: one accessor in ggml-sycl that hands out the backend's own in-order default queue as an opaque pointer, and
+# its declaration in ggml-sycl.h.
+#
+# WHY: the DeepSeek-V4.1 engine talks CUDA's legacy default stream (cudaStream_t == nullptr). Under the SYCL build that
+# stream is tools/v41/engine/sycl_compat's own queue, while ggml's kernels run on dpct::get_device(d).default_queue().
+# The engine's un-streamed copies would then only be ordered with ggml work by luck (cross-context USM is not
+# guaranteed by SYCL). With this accessor the shim adopts ggml's queue as its default stream: same queue, same context,
+# ordering is the queue's own in-order guarantee.
+#
+# APPLY: git -C <llama.cpp> apply tools/xolotl/ggml/xolotl-sycl-queue.patch   (right after xolotl-ggml.patch)
+# The shim declares the function weak, so building it WITHOUT ggml (the S1 self-test) still links.
+#
+# Upstream context: ggml/src/ggml-sycl/ggml-sycl.cpp and ggml/include/ggml-sycl.h of llama.cpp at
+# 3cf03257f219afbe7334045ff7c6a06ac68c627d (the xolotl pin).  Built and verified here with GGML_SYCL=ON on oneAPI
+# 2026.2 / Arc Pro B70 (Level Zero); see docs/xolotl-sycl-s2-report.md.
+--- a/ggml/include/ggml-sycl.h
++++ b/ggml/include/ggml-sycl.h
+@@ -52,6 +52,13 @@
+ // GGML_BACKEND_API bool ggml_backend_sycl_register_host_buffer(void * buffer, size_t size);
+ // GGML_BACKEND_API void ggml_backend_sycl_unregister_host_buffer(void * buffer);
+ 
++// XOLOTL-S2 (tools/xolotl/ggml/xolotl-sycl-queue.patch): expose the backend's own in-order default queue for
++// `device` as an opaque `sycl::queue *`.  The DeepSeek-V4.1 engine's CUDA-runtime compatibility layer adopts it as
++// its default stream, so the engine's null-stream copies are submitted to the queue ggml's kernels run on (CUDA's
++// legacy default stream is ordered with them; without this the shim's separate queue only happens to work through
++// cross-context USM).  NULL if `device` is out of range.  Valid once a SYCL backend has been initialised.
++GGML_BACKEND_API void * ggml_backend_sycl_get_default_queue(int device);
++
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_sycl_reg(void);
+ 
+ #ifdef  __cplusplus
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -6226,6 +6226,16 @@
+     std::exit(1);
+ }
+ 
++// XOLOTL-S2 (tools/xolotl/ggml/xolotl-sycl-queue.patch): the queue ggml-sycl itself submits to, as an opaque pointer.
++// `dpct::dev_mgr::get_device(device).default_queue()` is the in-order queue the backend's streams are built on
++// (ggml-sycl.cpp: the buffer types and the backend both take `device_i.default_queue()`), so submitting through it
++// keeps an external runtime's copies in the same ordered stream as the kernels.
++void * ggml_backend_sycl_get_default_queue(int device) {
++    GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_get_default_queue(%d)\n", device);
++    if (device < 0 || device >= ggml_backend_sycl_get_device_count()) return nullptr;
++    return (void *) &dpct::dev_mgr::instance().get_device((unsigned int) device).default_queue();
++}
++
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+ // backend

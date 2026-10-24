@@ -1,0 +1,23 @@
+--- llm-for-glm-flash/llama-cpp-ref/ggml/src/ggml-sycl/common.hpp	2026-10-15 08:47:14.993053141 +0800
++++ s2/llama.cpp/ggml/src/ggml-sycl/common.hpp	2026-10-24 12:59:20.494272793 +0800
+@@ -400,6 +400,20 @@
+     std::string name;
+     optimize_feature opt_feature;
+ 
++    // SYCL command-graph capture state.
++    //
++    // A weight reorder (reorder_qw(): async_malloc + memcpy + parallel_for + async_free) is a
++    // one-time layout install whose command group cannot be recorded into a graph: the graph
++    // ends up holding a node that depends on an event recorded outside the recording region,
++    // and finalize() rejects it ("Graph nodes cannot depend on events from outside the graph").
++    // A reorder is therefore never started while recording. opt_for_reorder[_id]() only sets
++    // graph_reorder_deferred, and the op runs on the plain layout for that pass (identical
++    // numbers, just not re-ordered); graph_compute then drops the unfinished recording and
++    // re-runs the call uncaptured once, which installs the reorder exactly as the non-graph
++    // path does. The next call captures cleanly - at most one deferral per newly seen weight.
++    bool graph_recording        = false;
++    bool graph_reorder_deferred = false;
++
+     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
+ 
+     explicit ggml_backend_sycl_context(int device) :
