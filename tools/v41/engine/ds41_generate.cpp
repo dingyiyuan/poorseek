@@ -786,6 +786,9 @@ int main(int argc, char ** argv) {
     apply_bias();   // the prune part now (the prompt routes with it); route_bias again once the VRAM cache is seeded
     std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, experts %s, %zu classes\n",
                  (now_ms() - t_load) / 1000.0, n_layer, (long long) ctx, a.prefill_chunk, tier.mode(), TG.cls_gu.size());
+    // TASK 2: the first attention span's one-shot kernel costs (1,825 ms measured: two 850 ms K casts and a 94 ms
+    // gather, all ~1.6 ms once warm) are paid HERE, on scratch tensors, so they do not land on the first prompt.
+    for (int st = 0; st < pipe.n_stages(); ++st) pipe.dense(st).warm_attn();
 
     // ---- the forward pieces
     std::vector<int> ids1((size_t) top_k);

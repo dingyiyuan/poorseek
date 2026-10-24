@@ -1686,22 +1686,16 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached) {
 // kernels per decode token).  STRATA_FQ_COMPOSITE=1 in such a build: the composite.
 // get_rows whose result is F16 (f16) or the usual F32.  ggml_get_rows always declares F32; the CUDA kernel writes any
 // of F32 / F16 / BF16, dequantizing in float and rounding with the same conversion a later cast would use, so retyping
-// the (not yet allocated) result is the gather + cast in one step without the F32 intermediate.  CUDA only.
+// the (not yet allocated) result is the gather + cast in one step without the F32 intermediate.  ggml-sycl now writes
+// an F16 result too (getrows.cpp, k_get_rows_f16x8: 8 elements per work-item, the same float -> f16 rounding the cpy
+// used), so both backends take the one-step form; the tensor is retyped before the graph is allocated, so the F32
+// result of the same rows does not exist and neither does the cpy over it.
 static ggml_tensor * rows_as(ggml_context * gc, ggml_tensor * a, ggml_tensor * idx, bool f16) {
     ggml_tensor * t = ggml_get_rows(gc, a, idx);
     if (f16 && t->type == GGML_TYPE_F32) {
-#if defined(DS41_SYCL)
-        // ggml-sycl writes only F32/I32 get_rows results: ggml_sycl_op_get_rows asserts
-        // `dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_I32` (getrows.cpp:328) and aborts the process.
-        // Gather in F32 and round once with a device cast (GGML_OP_CPY, cpy_1_f32_f16): the same dequantize in
-        // float then float->f16 conversion the CUDA kernel performs in one step, so the bits are identical and
-        // only the transient F32 result is extra.
-        t = ggml_cast(gc, t, GGML_TYPE_F16);
-#else
         t->type = GGML_TYPE_F16;
         t->nb[0] = ggml_type_size(GGML_TYPE_F16);
         for (int i = 1; i < GGML_MAX_DIMS; ++i) t->nb[i] = t->nb[i - 1] * t->ne[i - 1];
-#endif
     }
     return t;
 }
@@ -1987,11 +1981,26 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
             return whole ? t2 : ggml_cont(gc, ggml_view_2d(gc, t2, t2->ne[0], gk, t2->nb[1], (size_t) rel * t2->nb[1]));
         };
         ggml_tensor * gkv2 = colv(kv2);
-        ggml_tensor * wsrc = ggml_concat(gc, SL.raw->type == GGML_TYPE_F32 ? SL.raw : ggml_cast(gc, SL.raw, GGML_TYPE_F32), gkv2, 1);     // [DH, RAW + k]
         // F16 key path for this graph only when the zero index covers its padding (255 pad rows x k queries at most)
         const bool f16 = im.f16_gather && 255 * gk <= im.zidx->ne[0];
-        ggml_tensor * Kw = ggml_reshape_3d(gc, rows_as(gc, wsrc, b.v1(im.i_widx, SWA * gk, (size_t) gc0 * SWA * 4), f16), DH, SWA, gk);
+        // k16: the one-source key path.  Every row a query can attend - its window rows (the slot's ring and this pass's
+        // own rows) and its selected compressed rows - is gathered by ONE get_rows from ONE F16 image of the sources,
+        // straight into the [DH, M, k] F16 key tensor the flash-attn reads.  So the F32 gather result, the f32->f16 cpy
+        // over it and the two concatenations of the key rows (window+compressed, then the pad) do not exist.  The
+        // values are the old path's: an F16 image of the same source rounds each value exactly once, which is what the
+        // old gather(f32) + cpy(f32->f16) did (bf16 -> float is exact, an f32 value rounds once), and the pad is fully
+        // masked (see the assembly below).
+        const bool k16 = f16 && !merge_fa;
         ggml_tensor * Mw = b.cols2(im.i_wmask, SWA, gk, gc0);
+        ggml_tensor * ksrc = nullptr, * kiidx = nullptr;   // k16: the merged F16 source and its row indices
+        ggml_tensor * Kw = nullptr;                        // the F32 path's window keys
+        if (k16) {
+            ksrc = ggml_concat(gc, ggml_cast(gc, SL.raw, GGML_TYPE_F16), ggml_cast(gc, gkv2, GGML_TYPE_F16), 1);   // [DH, RAW + k]
+            kiidx = ggml_view_2d(gc, im.i_widx, SWA, gk, im.i_widx->nb[1], (size_t) gc0 * SWA * 4);                // [SWA, k]
+        } else {
+            ggml_tensor * wsrc = ggml_concat(gc, SL.raw->type == GGML_TYPE_F32 ? SL.raw : ggml_cast(gc, SL.raw, GGML_TYPE_F32), gkv2, 1);     // [DH, RAW + k]
+            Kw = ggml_reshape_3d(gc, rows_as(gc, wsrc, b.v1(im.i_widx, SWA * gk, (size_t) gc0 * SWA * 4), f16), DH, SWA, gk);
+        }
         {
             const int64_t k = std::min<int64_t>(gk, RAW);
             ggml_tensor * last = ggml_view_2d(gc, gkv2, DH, k, gkv2->nb[1], (size_t) (gk - k) * gkv2->nb[1]);
@@ -2000,6 +2009,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
 
         // ---- compressed KV (kv sources write it; every ratio > 0 layer reads its source's)
         ggml_tensor * Kc = nullptr, * Mc = nullptr;
+        int64_t Ksel = 0;   // k16: how many selected compressed rows the merged index carries
         ggml_tensor * comp_w = nullptr, * idxk_w = nullptr;   // this group's writes (later reads depend on them)
         const int64_t gcap = gp.cap;
         if (r) {
@@ -2131,29 +2141,59 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                     sel = ggml_view_2d(gc, IS.sel, K, gk, IS.sel->nb[1], (size_t) gc0 * IS.sel->nb[1]);
                     selm = ggml_view_2d(gc, IS.selm, K, gk, IS.selm->nb[1], (size_t) gc0 * IS.selm->nb[1]);
                 }
-                Kc = ggml_reshape_3d(gc, rows_as(gc, comp, ggml_cont(gc, ggml_reshape_1d(gc, ggml_cont(gc, sel), K * gk)), f16), DH, K, gk);
+                if (k16) {   // the compressed rows join the same F16 source (the old path gathered them separately)
+                    // `sel` indexes the compressed pool from ITS row 0 (that is what the separate gather it replaces
+                    // read); in the merged source the pool starts after the window rows, so the selection carries that
+                    // base.  F32 holds these row ids exactly (a context's row count is far under 2^24) and the round
+                    // trip through F32 is the pattern attn_core_slab uses for the same job.
+                    const float base = (float) ksrc->ne[1];   // = the rows of [ring | this pass's rows]
+                    ggml_tensor * selo = ggml_cast(gc, ggml_scale_bias(gc, ggml_cast(gc, ggml_cont(gc, sel), GGML_TYPE_F32),
+                                                                      1.0f, base), GGML_TYPE_I32);
+                    ksrc = ggml_concat(gc, ksrc, ggml_cast(gc, comp, GGML_TYPE_F16), 1);
+                    kiidx = ggml_concat(gc, kiidx, selo, 0);   // (sel may be a strided view of a sel slab)
+                    Ksel = K;
+                } else {
+                    Kc = ggml_reshape_3d(gc, rows_as(gc, comp, ggml_cont(gc, ggml_reshape_1d(gc, ggml_cont(gc, sel), K * gk)), f16), DH, K, gk);
+                }
                 Mc = ggml_cont(gc, selm);
                 // the source's rows must be read AFTER this pass wrote its own (a kv source attends to its new row)
             }
         }
 
         // ---- attention: per query its window rows + its top-k compressed rows, one flash-attn with the query as batch
-        ggml_tensor * Kall = Kc ? ggml_concat(gc, Kw, Kc, 1) : Kw;                                 // [DH, M, k]
         ggml_tensor * Mall = Mc ? ggml_concat(gc, Mw, Mc, 0) : Mw;                                 // [M, k]
-        if (merge_fa) { k_parts.push_back(KPart { Kall, Mall, gk, f16 }); continue; }
-        int64_t M = Kall->ne[1];
-        if (!im.cpu && M % 256) {   // ggml-cuda's flash-attn for d 512 wants the key count a multiple of 256
-            const int64_t pad = 256 - M % 256;
-            // F16 has no CUDA pad: concat zeros gathered from the one zero row (F16 -> F16, exact) - the same zeros
-            Kall = f16 ? ggml_concat(gc, Kall, ggml_reshape_3d(gc, rows_as(gc, im.zpad16, ggml_view_1d(gc, im.zidx, pad * gk, 0), true),
-                                                               DH, pad, gk), 1)
-                 : ggml_pad(gc, Kall, 0, (int) pad, 0, 0);
-            Mall = ggml_concat(gc, Mall, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, pad, gk), NEG_INF), 0);
-            M += pad;
+        int64_t M = Mw->ne[0] + (Mc ? Ksel : 0);
+        ggml_tensor * k4 = nullptr;
+        if (k16) {
+            // the key count is completed to a multiple of 256 (the flash-attn's KV_max scan works in 256-key blocks).
+            // The pad rows come from the same gather, indexed at the source's row 0, and their mask is -inf: the
+            // flash-attn's pad terms are exactly exp(-inf) = 0, so what those keys hold cannot change the output (the
+            // md5 gate below is the check) - they are not gathered, cast and concatenated as their own 128x512 rows.
+            const int64_t pad = M % 256 ? 256 - M % 256 : 0;
+            if (pad > 0) {
+                kiidx = ggml_concat(gc, kiidx, ggml_view_2d(gc, im.zidx, pad, gk, (size_t) pad * 4, 0), 0);   // = 0
+                Mall = ggml_concat(gc, Mall, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, pad, gk), NEG_INF), 0);
+                M += pad;
+            }
+            ggml_tensor * kf = rows_as(gc, ksrc, ggml_reshape_1d(gc, kiidx, M * gk), true);             // [DH, M * k]
+            k4 = ggml_reshape_4d(gc, kf, DH, M, 1, gk);
+        } else {
+            ggml_tensor * Kall = Kc ? ggml_concat(gc, Kw, Kc, 1) : Kw;                             // [DH, M, k]
+            if (merge_fa) { k_parts.push_back(KPart { Kall, Mall, gk, f16 }); continue; }
+            M = Kall->ne[1];
+            if (!im.cpu && M % 256) {   // ggml-cuda's flash-attn for d 512 wants the key count a multiple of 256
+                const int64_t pad = 256 - M % 256;
+                // F16 has no CUDA pad: concat zeros gathered from the one zero row (F16 -> F16, exact) - the same zeros
+                Kall = f16 ? ggml_concat(gc, Kall, ggml_reshape_3d(gc, rows_as(gc, im.zpad16, ggml_view_1d(gc, im.zidx, pad * gk, 0), true),
+                                                                   DH, pad, gk), 1)
+                     : ggml_pad(gc, Kall, 0, (int) pad, 0, 0);
+                Mall = ggml_concat(gc, Mall, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, pad, gk), NEG_INF), 0);
+                M += pad;
+            }
+            k4 = Kall->type == GGML_TYPE_F16 ? ggml_reshape_4d(gc, Kall, DH, M, 1, gk)
+                                             : ggml_cast(gc, ggml_reshape_4d(gc, Kall, DH, M, 1, gk), GGML_TYPE_F16);
         }
         ggml_tensor * gq = whole ? q : ggml_cont(gc, ggml_view_3d(gc, q, DH, NH, gk, q->nb[1], q->nb[2], (size_t) rel * q->nb[2]));
-        ggml_tensor * k4 = Kall->type == GGML_TYPE_F16 ? ggml_reshape_4d(gc, Kall, DH, M, 1, gk)
-                                                       : ggml_cast(gc, ggml_reshape_4d(gc, Kall, DH, M, 1, gk), GGML_TYPE_F16);
         ggml_tensor * q4 = ggml_permute(gc, ggml_reshape_4d(gc, gq, DH, NH, 1, gk), 0, 2, 1, 3);    // [DH, 1, NH, k]
         ggml_tensor * m4 = ggml_cast(gc, ggml_reshape_4d(gc, Mall, M, 1, 1, gk), GGML_TYPE_F16);
         ggml_tensor * og = ggml_flash_attn_ext(gc, q4, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
@@ -3089,6 +3129,64 @@ size_t Ds41Dense::span_graph_bytes(int pos_end, int n) {
     im.rows_mode = saved_rows;
     im.graph_bytes_memo[key] = mx;
     return mx;
+}
+
+// TASK 2: a prompt's FIRST attention span pays costs that never come back.  DS41_ATTN_PROF (2026-10-25) billed that
+// span (layer 0, col0 0) at 1,825 ms where every later span's same nodes cost ~1.6 ms: the two DH-wide f32 -> f16 K
+// casts measured 850 ms EACH (2.6 warm) and the merged F16 gather 94 ms (1.6 warm).  The ratios say what it is - the
+// small casts are hit 327x while the 384 MiB gather is hit 59x, so it is per-KERNEL one-shot cost (first launch), not
+// per-byte - and either way the cure is the same: run the identical op / type / shape signatures once here, at setup,
+// on scratch tensors.  No model state is read or written and the scratch graph and its buffer are freed before the
+// prompt.  The scratch destination is the real [DH, M, 1, n] F16 key tensor, so its 384 MiB are first-touched here too.
+bool Ds41Dense::warm_attn(int span) {
+    Impl & im = *p_;
+    if (im.cpu || !im.backend || im.DH < 1 || im.SWA < 1) return true;
+    auto now = [] {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    const double t0 = now();
+    const int64_t DH = im.DH, SWA = im.SWA, RAW = im.RAW;
+    const int64_t n = std::max<int64_t>(1, std::min<int64_t>((int64_t) span, im.S > 0 ? im.S : (int64_t) span));
+    const int64_t K = 512;                     // the top-k an index-sourced layer selects (what the flash-attn pads to)
+    int64_t M = SWA + K;
+    if (M % 256) M += 256 - M % 256;           // the key count the flash-attn's 256-key block scan wants
+    std::vector<uint8_t> meta(ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(256, false));
+    ggml_init_params ip = { meta.size(), meta.data(), true };
+    ggml_context * gc = ggml_init(ip);
+    if (!gc) return false;
+    bool ok = false;
+    ggml_gallocr_t ga = nullptr;
+    do {
+        // the merged F16 key source of one span: the ring rows and this pass's rows (both cast f32 -> f16 at DH width,
+        // the two 850 ms nodes), the compressed pool, and the ONE gather that drives the merged index into the
+        // [DH, M, 1, n] F16 key tensor (the 94 ms node).  The mask cast (M x n f32 -> f16) rides along.
+        ggml_tensor * ring = ggml_new_tensor_2d(gc, GGML_TYPE_F32, DH, RAW);
+        ggml_tensor * kv2  = ggml_new_tensor_2d(gc, GGML_TYPE_F32, DH, n);
+        ggml_tensor * comp = ggml_new_tensor_2d(gc, GGML_TYPE_F16, DH, K);
+        ggml_tensor * src16 = ggml_concat(gc, ggml_cast(gc, ring, GGML_TYPE_F16), ggml_cast(gc, kv2, GGML_TYPE_F16), 1);
+        src16 = ggml_concat(gc, src16, comp, 1);
+        ggml_tensor * idx = ggml_new_tensor_1d(gc, GGML_TYPE_I32, M * n);
+        ggml_tensor * k16 = ggml_reshape_4d(gc, rows_as(gc, src16, idx, true), DH, M, 1, n);
+        ggml_tensor * mask = ggml_cast(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, M, n), GGML_TYPE_F16);
+        ggml_cgraph * gf = ggml_new_graph_custom(gc, 256, false);
+        ggml_build_forward_expand(gf, k16);
+        ggml_build_forward_expand(gf, mask);
+        ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
+        if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) break;
+        // the gather reads its index: all zeros = the source's row 0 (in bounds) - garbage ids would read past the source
+        if (idx->buffer) {
+            std::vector<int32_t> z((size_t) (M * n), 0);
+            ggml_backend_tensor_set(idx, z.data(), 0, z.size() * 4);
+        }
+        if (ggml_backend_graph_compute(im.backend, gf) != GGML_STATUS_SUCCESS) break;
+        ggml_backend_synchronize(im.backend);
+        ok = true;
+    } while (false);
+    if (ga) ggml_gallocr_free(ga);
+    ggml_free(gc);
+    std::fprintf(stderr, "attn warm: the core's one-shot copy/gather kernels paid at setup (n %lld, M %lld, %.0f ms%s)\n",
+                 (long long) n, (long long) M, now() - t0, ok ? "" : ", SCRATCH GRAPH FAILED");
+    return ok;
 }
 
 // Wait for the pass's Engram reads (started by upload_inputs) and push the rows into the state tensor's columns.  A

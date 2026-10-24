@@ -174,6 +174,13 @@ public:
     /// ends at position pos_end: every layer kind's attention graph planned by a throwaway allocator (nothing is
     /// allocated), memoized on the visible compressed rows.  It grows with the context (the indexer's rows x queries).
     size_t span_graph_bytes(int pos_end, int n);
+    /// Pay the attention core's ONE-SHOT first-span costs at setup instead of inside the first real prompt
+    /// (DS41_ATTN_PROF, 2026-10-25: the first span - layer 0, col0 0 - cost 1,825 ms, of which the two DH-wide
+    /// f32 -> f16 K casts took 850 ms each instead of 2.6 and the merged F16 gather 94 ms instead of 1.6).  It runs the
+    /// same op / type / shape signatures once on SCRATCH tensors (no model state is read or written), so the copy and
+    /// gather kernels' one-shot cost lands here, before the prompt.  False only if the scratch graph could not be
+    /// allocated or computed: the caller may ignore it and the prompt then pays the cost itself.
+    bool warm_attn(int span = 512);
     /// Forget a narrowed span width: after a sub-batch's graph did not fit, attn_router_span keeps running narrower
     /// spans for the rest of the prompt; release_pass() or this resets it (the serve loop calls it per prompt).
     void reset_span_width();
