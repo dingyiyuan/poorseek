@@ -1,31 +1,89 @@
-# Rust
-/target
+# Generated, not source: deterministic build products of tools/ (see docs/).
+# tiny-qwen4exp.gguf is ~113 MB, over GitHub's 100 MB file limit -- regenerate with
+#   python tools/make_tiny_model.py
+bench/tiny-*.gguf
+bench/wide-*.gguf
+bench/micro/*.exe
+bench/micro/*.obj
+bench/micro/*.bin
+bench/micro/*.dll
+bench/micro/*.txt
+*.log
+build*/
+pack/
+logs/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# plan v0.3 P1 (repository hygiene, review E1): profiler captures and large diagnostic dumps stay out of git.
+*.nsys-rep
+
+# ds4 phase 0 tooling: compiled probes (build from the headers in tools/ds4/) and
+# golden dumps (large; regenerate with tools/ds4/make_goldens.sh).
+tools/ds4/route_probe
+tools/ds4/golden_dump
+bench/ds4-2026-10-05/goldens/
+bench/ds4-2026-10-05/profile-decode/
+bench/ds4-2026-10-08/ctx/
+
+# Pi harness metadata (local session state, not project source)
+*.sqlite
+*.npz
+*.occ1
+td.log
+
+# the expert-cache profile: regenerate with tools/make_default_profile.py (or make_profile.py
+# from a --dump-routing trace); setup.py points every model config's --expert-profile at it
+/data/expert-profile.bin
+
+# created by setup.py on the user's machine
+/.venv/
+/build/
+/third_party/llama.cpp
+/models/
+/packs/
+/mtp/
+/run-*.bat
+/run-*.sh
+/strata-*.json
+/strata-*.log
+/build-strata.bat
+/build-strata-cuda12.bat
+/build-cuda12/
+/.strata-mcp/
+
+# image encoder (setup.py --vision): build output and the generated build script
+build-vision*/
+build-vision.bat
+build-vision-cuda12.bat
+
+# setup.py outputs (engine, downloads) and release builds
+/engine/
+/engine-cuda12/
+/build-release*/
 /dist/
-/test-kv-cache/
-/scripts/__pycache__/
-**/*.rs.bk
-Cargo.lock.bak
+*.done
+/third_party/*.zip
 
-# Compiled shaders
-*.spv
+# IDEs
+.vscode/
+.idea/
+.cursor/
 
-# Models / weights (never commit)
-*.gguf
-models/
-*.safetensors
+/.ccache/
+/.rocm-win/
+out/
 
-# Editor / OS
-.DS_Store
-*.swp
-/ref/
-target-prof/
-/gui-data/
-/kv-sessions/
-/.update/
-/benchmark-data/
-/upstream-research/
-# Preserve local data from the retired resource-matrix harness.
-/artifacts/context-resource-matrix/
-/tests/context-resource/matrix.local.json
-bili_report_work/*
-followtasks.txt
+# generated task data that must ship with the benchmark (the repo-wide *.log rule would drop it)
+!tools/gauntlet/tasks/*/workspace/*.log
+
+# Private notes and add-ons live in private/ (never tracked); stray root session notes are ignored too.
+/private/
+/HANDOFF-*.md
+/HANDOFF_*.md
+/RESUME_PROMPT_*.md
+/START_HERE*.md
+
+# xmx-bmg/: out-of-tree AOT Battlemage build of the grouped XMX bench (sycl/tools/xmx_bmg_aot.sh)
+xmx-bmg/

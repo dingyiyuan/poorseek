@@ -1,0 +1,33 @@
+# ids
+05a6cb95
+06c33b5c
+1fe4684d
+2685a1e1
+4759986f
+53f21eb7
+5ad4ba53
+67c4d20a
+89a3ea74
+8b353b7b
+8ca554fe
+b3efb501
+b716ea37
+c6519bbc
+ceb2a95a
+d82be14f
+d874aee9
+e6c674a8
+f0541dd6
+f1a6407a
+f85cf8fd
+fcfa2811
+fd38c8b6
+# counts
+k_1e35 6
+k_2b91 2
+k_3f90 1
+k_55c2 1
+k_5a77 2
+k_6d47 3
+k_88aa 7
+k_8a12 1

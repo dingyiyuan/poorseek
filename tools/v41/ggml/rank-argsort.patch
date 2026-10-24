@@ -1,0 +1,179 @@
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5447,6 +5447,9 @@
+     GGML_ASSERT(a->ne[0] >= k);
+ 
+     struct ggml_tensor * result = ggml_argsort(ctx, a, GGML_SORT_ORDER_DESC);
++    // Strata-DS4 (tools/v41/ggml/rank-argsort.patch): only the first k of each row are read (the view below) - a
++    // backend may select them instead of sorting the whole row (CUDA: k <= 32, ggml-cuda/argsort.cu)
++    ggml_set_op_params_i32(result, 1, k);
+ 
+     result = ggml_view_4d(ctx, result,
+                 k, result->ne[1], result->ne[2], result->ne[3],
+--- a/ggml/src/ggml-cuda/argsort.cu
++++ b/ggml/src/ggml-cuda/argsort.cu
+@@ -216,6 +216,143 @@
+     }
+ }
+ 
++// Strata-DS4 (tools/v41/ggml/rank-argsort.patch): a row of <= 1024 columns sorted by RANK instead of the bitonic
++// network below.  Each thread owns a column, counts the columns that sort before it (value order, equal values by
++// ascending column) and writes itself at that rank: one pass over shared memory, one barrier.  The bitonic network
++// takes 45 barrier steps for 384 -> 512 columns and reads x from global memory per compare: 9 us per 384-wide row on
++// a 4090, and DeepSeek-V4.1 decode runs ~80 of them per token (router top-6 + prefetch top-16).  Equal values come out
++// in ascending column order (the network leaves their order to its wiring).  Keys are the float bits mapped to an
++// order-preserving uint (-0.0 before +0.0, NaNs at the ends), so the ranks always form a permutation.
++// GGML_CUDA_RANK_ARGSORT=0 restores the bitonic kernel.
++template<ggml_sort_order order>
++static __global__ void k_argsort_rank_f32_i32(const float * __restrict__ x, int * __restrict__ dst, const int ncols,
++                                              const int ncols4) {
++    extern __shared__ uint4 s_key4[];   // ncols rounded up to 4
++    unsigned * s_key = (unsigned *) s_key4;
++    const int64_t row = blockIdx.x;
++    const float * x_row = x + row * ncols;
++    for (int c = threadIdx.x; c < ncols4; c += blockDim.x) {
++        unsigned k = 0xFFFFFFFFu;   // padding: never before a real column (not smaller, and after it in column order)
++        if (c < ncols) {
++            const unsigned u = __float_as_uint(x_row[c]);
++            k = (u & 0x80000000u) ? ~u : (u | 0x80000000u);   // unsigned order = float order
++            if (order == GGML_SORT_ORDER_DESC) {
++                k = ~k;                                     // "sorts first" = "smaller key" in both orders
++            }
++        }
++        s_key[c] = k;
++    }
++    __syncthreads();
++    for (int e = threadIdx.x; e < ncols; e += blockDim.x) {
++        const unsigned ke = s_key[e];
++        int r = 0;
++        for (int f4 = 0; f4 < ncols4 / 4; ++f4) {
++            const uint4 k4 = s_key4[f4];
++            const int f = 4 * f4;
++            r += (k4.x < ke) | ((k4.x == ke) & (f + 0 < e));
++            r += (k4.y < ke) | ((k4.y == ke) & (f + 1 < e));
++            r += (k4.z < ke) | ((k4.z == ke) & (f + 2 < e));
++            r += (k4.w < ke) | ((k4.w == ke) & (f + 3 < e));
++        }
++        dst[row * ncols + r] = e;
++    }
++}
++
++// Strata-DS4 (tools/v41/ggml/rank-argsort.patch): ggml_argsort_top_k records k in op_params[1] (only the first k
++// columns of each sorted row are read through its view).  For k <= 32 of a row of <= 1024 one warp per row selects
++// them directly: each lane holds its columns' keys (column lane + 32 i) as 64-bit (key << 32 | column) composites in
++// registers, then k rounds of a 5-step shuffle minimum, the winning lane rescanning only its own columns.  The same
++// first k as the rank kernel / a stable sort (value order, equal values by ascending column), ~1 us instead of a
++// full sort of the row.  GGML_CUDA_RANK_ARGSORT=0 restores the bitonic kernel for every argsort.
++template<ggml_sort_order order, int NPL>   // NPL: columns per lane, >= ceil(ncols / 32)
++static __global__ void k_argsort_topk_warp_f32_i32(const float * __restrict__ x, int * __restrict__ dst, const int ncols,
++                                                   const int k, const int nrows) {
++    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
++    if (row >= nrows) {
++        return;
++    }
++    const int lane = threadIdx.x & 31;
++    const float * x_row = x + (int64_t) row * ncols;
++    unsigned long long key[NPL];
++#pragma unroll
++    for (int i = 0; i < NPL; ++i) {
++        const int c = lane + 32 * i;
++        unsigned long long kk = ~0ull;   // padding: after every real column
++        if (c < ncols) {
++            const unsigned u = __float_as_uint(x_row[c]);
++            unsigned kv = (u & 0x80000000u) ? ~u : (u | 0x80000000u);   // unsigned order = float order
++            if (order == GGML_SORT_ORDER_DESC) {
++                kv = ~kv;
++            }
++            kk = ((unsigned long long) kv << 32) | (unsigned) c;
++        }
++        key[i] = kk;
++    }
++    unsigned long long best = ~0ull;
++#pragma unroll
++    for (int i = 0; i < NPL; ++i) {
++        best = key[i] < best ? key[i] : best;
++    }
++    int * dst_row = dst + (int64_t) row * ncols;
++    for (int j = 0; j < k; ++j) {
++        unsigned long long m = best;
++#pragma unroll
++        for (int off = 16; off > 0; off >>= 1) {
++            const unsigned long long o = __shfl_xor_sync(0xFFFFFFFFu, m, off);
++            m = o < m ? o : m;
++        }
++        const int col = (int) (m & 0xFFFFFFFFull);
++        if (lane == 0) {
++            dst_row[j] = col;
++        }
++        if (lane == (col & 31)) {   // the winner drops that column and rescans its own
++            best = ~0ull;
++#pragma unroll
++            for (int i = 0; i < NPL; ++i) {
++                if (i == (col >> 5)) {
++                    key[i] = ~0ull;
++                }
++                best = key[i] < best ? key[i] : best;
++            }
++        }
++    }
++}
++
++template<ggml_sort_order order>
++static void argsort_topk_warp_launch(const float * x, int * dst, const int ncols, const int k, const int nrows,
++                                     cudaStream_t stream) {
++    const dim3 block_dims(128, 1, 1);   // 4 rows per block
++    const dim3 block_nums((nrows + 3) / 4, 1, 1);
++    const int npl = (ncols + 31) / 32;
++#define TOPK_NPL(N) if (npl <= N) { k_argsort_topk_warp_f32_i32<order, N><<<block_nums, block_dims, 0, stream>>>(x, dst, ncols, k, nrows); return; }
++    TOPK_NPL(1) TOPK_NPL(2) TOPK_NPL(4) TOPK_NPL(8) TOPK_NPL(12) TOPK_NPL(16) TOPK_NPL(24) TOPK_NPL(32)
++#undef TOPK_NPL
++    GGML_ABORT("fatal error");
++}
++
++static bool argsort_use_rank(const int ncols) {
++    static const bool on = [] {
++        const char * v = getenv("GGML_CUDA_RANK_ARGSORT");
++        return !(v && v[0] == '0');
++    }();
++    return on && ncols <= 1024;
++}
++
++static void argsort_f32_i32_cuda_rank(const float * x, int * dst, const int ncols, const int nrows,
++                                      ggml_sort_order order, cudaStream_t stream) {
++    const int ncols4 = (ncols + 3) & ~3;
++    const dim3 block_dims(std::min(1024, (ncols + 31) & ~31), 1, 1);
++    const dim3 block_nums(nrows, 1, 1);
++    const size_t shared_mem = ncols4 * sizeof(unsigned);
++    if (order == GGML_SORT_ORDER_ASC) {
++        k_argsort_rank_f32_i32<GGML_SORT_ORDER_ASC><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols4);
++    } else if (order == GGML_SORT_ORDER_DESC) {
++        k_argsort_rank_f32_i32<GGML_SORT_ORDER_DESC><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols4);
++    } else {
++        GGML_ABORT("fatal error");
++    }
++}
++
+ static int next_power_of_2(int x) {
+     int n = 1;
+     while (n < x) {
+@@ -266,6 +403,20 @@
+ 
+     enum ggml_sort_order order = (enum ggml_sort_order) dst->op_params[0];
+ 
++    if (argsort_use_rank((int) ncols)) {   // Strata-DS4: see k_argsort_rank_f32_i32 / k_argsort_topk_warp_f32_i32
++        const int k_used = dst->op_params[1];   // ggml_argsort_top_k: only the first k of a row are read
++        if (k_used > 0 && k_used <= 32 && k_used <= ncols) {
++            if (order == GGML_SORT_ORDER_ASC) {
++                argsort_topk_warp_launch<GGML_SORT_ORDER_ASC>(src0_d, (int *) dst_d, (int) ncols, k_used, (int) nrows, stream);
++            } else {
++                argsort_topk_warp_launch<GGML_SORT_ORDER_DESC>(src0_d, (int *) dst_d, (int) ncols, k_used, (int) nrows, stream);
++            }
++            return;
++        }
++        argsort_f32_i32_cuda_rank(src0_d, (int *) dst_d, (int) ncols, (int) nrows, order, stream);
++        return;
++    }
++
+ #ifdef GGML_CUDA_USE_CUB
+     const int    ncols_pad      = next_power_of_2(ncols);
+     const size_t shared_mem     = ncols_pad * sizeof(int);

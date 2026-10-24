@@ -1,0 +1,14 @@
+# Exemptions (gateway v3). A request covered by a row here is NOT counted against any limit.
+# Ranges are left-closed, right-open (from <= t < to) and in UTC.
+#
+# The `key` column scopes the row, and it is the ONLY difference between the two forms -
+# they look alike and they do not behave alike:
+#   *        the row covers EVERY key of the tenant,
+#   k_xxxx   the row covers ONLY that one key - the tenant's other keys are still counted
+#            inside the range.
+# Read the column, not just the tenant.
+#
+#   tenant  key      from                   to                     reason
+hooli     *        2026-10-16T03:08:20Z   2026-10-16T03:08:40Z   maintenance: the whole tenant is drained
+hooli     k_1e35   2026-10-16T03:22:40Z   2026-10-16T03:22:50Z   staged cutover: only this one key is drained
+stark     *        2026-10-16T03:15:00Z   2026-10-16T03:15:20Z   failover drill

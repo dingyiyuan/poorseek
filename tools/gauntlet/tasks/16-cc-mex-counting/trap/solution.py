@@ -1,0 +1,15 @@
+"""THE TRAP: a rejected Codeforces submission that passes the examples: compiles the C++ below with g++ -O2 (once, cached next to this file) and runs it on stdin."""
+import hashlib
+import os
+import subprocess
+import sys
+
+SRC = '#include <bits/stdc++.h>\nusing namespace std;\nconst int N = 2005;\nint b[N], n, k;\nint f[2][105][N], g[2][105][N];\nlong long jc[N * 2], inv[N * 2];\nint main() {\n  scanf("%d %d", &n, &k);\n  for (int i = (1), e_ = (n); i <= e_; i++) scanf("%d", &b[i]), b[i] -= k;\n  k += k;\n  jc[0] = inv[0] = jc[1] = inv[1] = 1;\n  for (int i = (2), e_ = (n + n + 2); i <= e_; i++)\n    jc[i] = jc[i - 1] * i % 998244353,\n    inv[i] = inv[998244353 % i] * (998244353 - 998244353 / i) % 998244353;\n  for (int i = (2), e_ = (n + n + 2); i <= e_; i++)\n    inv[i] = inv[i - 1] * inv[i] % 998244353;\n  long long ans = 0;\n  f[0][0][0] = 1;\n  for (int i = (0), e_ = (n); i <= e_; i++) {\n    int u = (i & 1), v = u ^ 1;\n    for (int j = (0), e_ = (k + 1); j <= e_; j++)\n      memset(f[v][j], 0, sizeof(f[v][j][0]) * (i + 2)),\n          memset(g[v][j], 0, sizeof(g[v][j]) * (i + 2));\n    for (int j = (0), e_ = (k); j <= e_; j++)\n      for (int t = (0), e_ = (i); t <= e_; t++)\n        if (g[u][j][t]) {\n          ((f[u][j][t] += g[u][j][t]) &&\n           (f[u][j][t] -= (f[u][j][t] >= 998244353) ? 998244353 : 0));\n          if (t && j < k)\n            (g[u][j + 1][t - 1] =\n                 ((1ll * g[u][j][t] * t) + (g[u][j + 1][t - 1])) % 998244353);\n        }\n    for (int j = (0), e_ = (k); j <= e_; j++)\n      for (int t = (0), e_ = (i); t <= e_; t++)\n        if (f[u][j][t]) {\n          if (i == n) {\n            int d = n - b[i] - j;\n            if (d >= t)\n              (ans = ((1ll * f[u][j][t] * jc[d] % 998244353 * inv[d - t]) +\n                      (ans)) %\n                     998244353);\n            continue;\n          }\n          int x = j - (b[i + 1] - b[i]);\n          if (x > k) continue;\n          if (x >= 0)\n            (f[v][x][t] = ((1ll * f[u][j][t] * (b[i] + j + t)) + (f[v][x][t])) %\n                          998244353),\n                (f[v][x][t + 1] =\n                     ((f[u][j][t]) + (f[v][x][t + 1])) % 998244353);\n          if (x < -1) {\n            int d = b[i + 1] - (b[i] + j) - 1;\n            if (t >= d)\n              (g[v][0][t - d] =\n                   ((1ll * f[u][j][t] * jc[t] % 998244353 * inv[t - d]) +\n                    (g[v][0][t - d])) %\n                   998244353);\n          } else\n            ((g[v][x + 1][t] += f[u][j][t]) &&\n             (g[v][x + 1][t] -= (g[v][x + 1][t] >= 998244353) ? 998244353 : 0));\n        }\n  }\n  printf("%lld", ans);\n  return 0;\n}\n'
+
+here = os.path.dirname(os.path.abspath(__file__))
+exe = os.path.join(here, ".build-" + hashlib.sha1(SRC.encode()).hexdigest()[:12])
+if not os.path.exists(exe):
+    with open(exe + ".cpp", "w") as f:
+        f.write(SRC)
+    subprocess.run(["g++", "-O2", "-std=gnu++17", "-o", exe, exe + ".cpp"], check=True)
+sys.exit(subprocess.run([exe]).returncode)

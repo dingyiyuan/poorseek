@@ -1,0 +1,4 @@
+{"id": "03-raytracer", "category": "graphics / 3D math",
+ "prompt": "Implement render() in raytrace.py exactly as its docstring specifies. Hidden tests render full scenes (spheres, a checkerboard floor that crosses negative coordinates, shadows, reflections) and compare them pixel by pixel with a reference image. Use the tools; when you are done, call submit.",
+ "max_steps": 10, "max_test_runs": 6,
+ "trap": "checker cells with int() (truncates toward zero) instead of floor(): the floor pattern shifts for negative x/z; also shadow-ray epsilon, reflection depth, pixel-centre sampling, y flip"}

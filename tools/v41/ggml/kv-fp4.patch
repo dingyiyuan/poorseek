@@ -1,0 +1,281 @@
+diff -ru a/ggml/src/ggml-cuda/cpy-utils.cuh b/ggml/src/ggml-cuda/cpy-utils.cuh
+--- a/ggml/src/ggml-cuda/cpy-utils.cuh
++++ b/ggml/src/ggml-cuda/cpy-utils.cuh
+@@ -186,6 +186,98 @@
+     y->d = sumq2 > 0 ? sumqx/sumq2 : d;
+ }
+ 
++// ---- Strata DS4.1 FP4 KV caches (tools/v41/engine/ds41_dense.cpp --kv-fp4).  The graph's fake-quant has already put
++// every value on an FP4 grid - the compressed KV on e2m1 x an E4M3 scale per 16 (NVFP4), the indexer keys on
++// e2m1 x a power-of-2 scale per 32 (MXFP4) - and these two quantizers pack such values EXACTLY: per (sub-)block they
++// try the scales the grid admits (amax / q, q an e2m1 magnitude, snapped to the scale format) and keep the first that
++// reproduces every value bit for bit (checked by multiplication, which is exact here; fast-math division is only used
++// to find candidates).  Values not on such a grid fall back to the q = 6 scale with nearest codes (approximate).
++static __device__ __forceinline__ float ds41_e2m1_mag(int c) {   // code 0..7 -> 0, 0.5, 1, 1.5, 2, 3, 4, 6
++    return c < 4 ? 0.5f * (float) c : (c == 4 ? 2.0f : c == 5 ? 3.0f : c == 6 ? 4.0f : 6.0f);
++}
++static __device__ __forceinline__ int ds41_e2m1_nearest(float v) {   // |v| -> the nearest e2m1 code (ties: lower code)
++    const float a = fminf(fabsf(v), 6.0f);
++    int best = 0; float err = a;
++    for (int c = 1; c < 8; ++c) { const float e = fabsf(a - ds41_e2m1_mag(c)); if (e < err) { err = e; best = c; } }
++    return best;
++}
++// value x and scale s: the code whose value * s == x exactly, or -1
++static __device__ __forceinline__ int ds41_e2m1_exact(float x, float s) {
++    const int c = ds41_e2m1_nearest(x / s);
++    const float m = ds41_e2m1_mag(c);
++    if (m * s == fabsf(x)) return c | (x < 0.0f ? 8 : 0);
++    return -1;
++}
++// x >= 0 -> the nearest E4M3 value (RNE, subnormal spacing 2^-9, saturating at 448), as float
++static __device__ __forceinline__ float ds41_round_e4m3(float x) {
++    if (!(x > 0.0f)) return 0.0f;
++    if (x >= 448.0f) return 448.0f;
++    if (x < 0x1p-6f) return rintf(x * 512.0f) * 0x1p-9f;
++    int e; frexpf(x, &e);                                    // x = m 2^e, m in [0.5, 1): spacing 2^(e-4)
++    const float u = ldexpf(1.0f, e - 4);
++    return rintf(x * ldexpf(1.0f, 4 - e)) * u;
++}
++static __device__ __forceinline__ uint8_t ds41_e4m3_bits(float s) {   // s an E4M3 value > 0
++    if (s < 0x1p-6f) return (uint8_t) (int) (s * 512.0f);
++    int e; const float m = frexpf(s, &e);                    // s = (2m) 2^(e-1)
++    return (uint8_t) (((e - 1 + 7) << 3) | ((int) ((2.0f * m - 1.0f) * 8.0f + 0.5f) & 7));
++}
++
++static __device__ void quantize_f32_nvfp4_ds41_block(const float * __restrict__ x, block_nvfp4 * __restrict__ y) {
++    for (int sb = 0; sb < QK_NVFP4/QK_NVFP4_SUB; ++sb) {
++        const float * xs = x + sb*QK_NVFP4_SUB;
++        float amax = 0.0f;
++        for (int j = 0; j < QK_NVFP4_SUB; ++j) amax = fmaxf(amax, fabsf(xs[j]));
++        float s = 0x1p-9f;
++        bool exact = amax == 0.0f;
++        if (!exact) {
++            const float qm[7] = { 6.0f, 4.0f, 3.0f, 2.0f, 1.5f, 1.0f, 0.5f };
++            for (int k = 0; k < 7 && !exact; ++k) {
++                const float c = ds41_round_e4m3(amax / qm[k]);
++                if (c <= 0.0f) continue;
++                bool ok = true;
++                for (int j = 0; j < QK_NVFP4_SUB && ok; ++j) ok = ds41_e2m1_exact(xs[j], c) >= 0;
++                if (ok) { s = c; exact = true; }
++            }
++            if (!exact) s = fmaxf(ds41_round_e4m3(amax / 6.0f), 0x1p-9f);
++        }
++        y->d[sb] = ds41_e4m3_bits(s);
++        for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
++            int c0 = ds41_e2m1_exact(xs[j], s), c1 = ds41_e2m1_exact(xs[j + QK_NVFP4_SUB/2], s);
++            if (c0 < 0) c0 = ds41_e2m1_nearest(xs[j] / s) | (xs[j] < 0.0f ? 8 : 0);
++            if (c1 < 0) c1 = ds41_e2m1_nearest(xs[j + QK_NVFP4_SUB/2] / s) | (xs[j + QK_NVFP4_SUB/2] < 0.0f ? 8 : 0);
++            y->qs[sb*(QK_NVFP4_SUB/2) + j] = (uint8_t) (c0 | (c1 << 4));
++        }
++    }
++}
++
++static __device__ void quantize_f32_mxfp4_ds41_block(const float * __restrict__ x, block_mxfp4 * __restrict__ y) {
++    float amax = 0.0f;
++    for (int j = 0; j < QK_MXFP4; ++j) amax = fmaxf(amax, fabsf(x[j]));
++    int E = -127;                                            // scale 2^E, E8M0 byte E + 127
++    if (amax > 0.0f) {
++        int e; frexpf(amax, &e);                             // amax in [2^(e-1), 2^e): the floor rule's E = e - 3
++        bool found = false;
++        for (int k = 0; k < 4 && !found; ++k) {
++            const int t = e - 3 + (k == 0 ? 0 : k == 1 ? 1 : k == 2 ? -1 : 2);
++            const float s = ldexpf(1.0f, t);
++            bool ok = true;
++            for (int j = 0; j < QK_MXFP4 && ok; ++j) ok = ds41_e2m1_exact(x[j], s) >= 0;
++            if (ok) { E = t; found = true; }
++        }
++        if (!found) { int e2; frexpf(amax / 6.0f, &e2); E = e2; }   // pow2 ceil of amax / 6 (approximate path)
++    }
++    E = max(-126, min(127, E));
++    y->e = (uint8_t) (E + 127);
++    const float s = ldexpf(1.0f, E);
++    for (int j = 0; j < QK_MXFP4/2; ++j) {
++        int c0 = ds41_e2m1_exact(x[j], s), c1 = ds41_e2m1_exact(x[j + QK_MXFP4/2], s);
++        if (c0 < 0) c0 = ds41_e2m1_nearest(x[j] / s) | (x[j] < 0.0f ? 8 : 0);
++        if (c1 < 0) c1 = ds41_e2m1_nearest(x[j + QK_MXFP4/2] / s) | (x[j + QK_MXFP4/2] < 0.0f ? 8 : 0);
++        y->qs[j] = (uint8_t) (c0 | (c1 << 4));
++    }
++}
++
+ // Wrapper functions for cpy.cu compatibility
+ static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
+     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);
+diff -ru a/ggml/src/ggml-cuda/dequantize.cuh b/ggml/src/ggml-cuda/dequantize.cuh
+--- a/ggml/src/ggml-cuda/dequantize.cuh
++++ b/ggml/src/ggml-cuda/dequantize.cuh
+@@ -435,6 +435,24 @@
+     }
+ }
+ 
++// Strata DS4.1 --kv-fp4: NVFP4 rows for get_rows (a QK_K super-block = 4 NVFP4 blocks; 32 threads x 8 values).
++// Same values as dequantize_block_nvfp4 (convert.cu): ue4m3(d) (= E4M3 / 2) x kvalues (= 2 x e2m1) - exact.
++template<typename dst_t>
++static __device__ __forceinline__ void dequantize_nvfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
++    const block_nvfp4 * x = (const block_nvfp4 *) vx + ibs*(QK_K/QK_NVFP4);
++    const int b  = tid/8;        // block 0..3
++    const int sb = (tid%8)/2;    // sub-block 0..3
++    const int h  = tid%2;        // bytes 0-3 / 4-7 of the sub-block
++    const block_nvfp4 & xb = x[b];
++    const float d = ggml_cuda_ue4m3_to_fp32(xb.d[sb]);
++    const uint8_t * q = xb.qs + sb*(QK_NVFP4_SUB/2) + 4*h;
++    dst_t * y = yy + b*QK_NVFP4 + sb*QK_NVFP4_SUB + 4*h;
++    for (int j = 0; j < 4; ++j) {
++        y[j]                  = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q[j] & 0x0F]);
++        y[j + QK_NVFP4_SUB/2] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q[j] >> 4]);
++    }
++}
++
+ template<typename dst_t>
+ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+ 
+diff -ru a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -617,6 +617,28 @@
+     }
+ }
+ 
++// Strata DS4.1 --kv-fp4: MXFP4 K rows (the lightning indexer's keys).  E8M0(e) x e2m1 - exact values.
++template <typename T, int ne>
++static __device__ __forceinline__ void dequantize_V_mxfp4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
++    const block_mxfp4 * x = (const block_mxfp4 *) vx;
++    const int64_t ib  = i0 / QK_MXFP4;
++    const int     iqs = i0 % QK_MXFP4;
++    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e) * 0.5f;
++#pragma unroll
++    for (int l = 0; l < ne; ++l) {
++        const int k = iqs + l;
++        const uint8_t q = x[ib].qs[k % (QK_MXFP4/2)];
++        const float v = d * kvalues_mxfp4[k < QK_MXFP4/2 ? (q & 0x0F) : (q >> 4)];
++        if constexpr (std::is_same<T, float>::value) {
++            ((float *) dst)[l] = v;
++        } else if constexpr (std::is_same<T, half>::value) {
++            ((half *) dst)[l] = __float2half(v);
++        } else {
++            static_assert(std::is_same_v<T, void>, "unsupported type");
++        }
++    }
++}
++
+ template <ggml_type type_K, int D, int nthreads>
+ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
+     if constexpr (type_K == GGML_TYPE_F16) {
+@@ -655,6 +677,8 @@
+         return dequantize_V_q8_0<T, ne>;
+     } else if constexpr (type_V == GGML_TYPE_BF16) {
+         return dequantize_V_bf16<float, ne>;
++    } else if constexpr (type_V == GGML_TYPE_MXFP4) {
++        return dequantize_V_mxfp4<T, ne>;
+     } else {
+         static_assert(type_V == -1, "bad type");
+         return nullptr;
+diff -ru a/ggml/src/ggml-cuda/getrows.cu b/ggml/src/ggml-cuda/getrows.cu
+--- a/ggml/src/ggml-cuda/getrows.cu
++++ b/ggml/src/ggml-cuda/getrows.cu
+@@ -404,6 +404,10 @@
+             get_rows_cuda_kq<32, dst_t, dequantize_mxfp4<dst_t>>(src0_d, src1_d, dst_d,
+                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+             break;
++        case GGML_TYPE_NVFP4:   // Strata DS4.1 --kv-fp4
++            get_rows_cuda_kq<32, dst_t, dequantize_nvfp4<dst_t>>(src0_d, src1_d, dst_d,
++                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++            break;
+         default:
+             GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
+             break;
+diff -ru a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5215,6 +5215,7 @@
+                         return true;
+                     case GGML_TYPE_IQ4_NL:
+                     case GGML_TYPE_MXFP4:
++                    case GGML_TYPE_NVFP4:   // Strata DS4.1 --kv-fp4 (64-value blocks, 4 per super-block)
+                         // 32-value sub-blocks, the row size does not guarantee
+                         // the QK_K super-blocks the get_rows kernel iterates on
+                         return op->src[0]->ne[0] % QK_K == 0;
+@@ -5232,7 +5233,8 @@
+                            (
+                                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
+                                op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
+-                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
++                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
++                               op->type == GGML_TYPE_NVFP4 || op->type == GGML_TYPE_MXFP4) &&
+                                op->src[0]->type == GGML_TYPE_F32
+                            ) || (
+                                op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
+diff -ru a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
+--- a/ggml/src/ggml-cuda/lightning-indexer.cu
++++ b/ggml/src/ggml-cuda/lightning-indexer.cu
+@@ -448,7 +448,7 @@
+ 
+     if (n_embd == 128 && n_head == 64) {
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
++        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_MXFP4) {
+             // use wmma kernel
+             constexpr int K_VECS_PER_BLOCK = 32;
+             constexpr int WARPS_PER_BLOCK = 8;
+@@ -484,12 +484,14 @@
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_Q5_1)
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_Q8_0)
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_BF16)
++            // Strata DS4.1 --kv-fp4: MXFP4 keys on the fp32 vec kernel (as BF16) - the wmma kernel computes in fp16
++            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_MXFP4)
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_F32)
+             GGML_ABORT("fatal error");
+         }
+     } else if (n_embd == 128 && n_head == 32) {
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
++        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_MXFP4) {
+             // use wmma kernel
+             constexpr int K_VECS_PER_BLOCK = 32;
+             constexpr int WARPS_PER_BLOCK = 8;
+@@ -525,6 +527,8 @@
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_Q5_1)
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_Q8_0)
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_BF16)
++            // Strata DS4.1 --kv-fp4: MXFP4 keys on the fp32 vec kernel (as BF16) - the wmma kernel computes in fp16
++            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_MXFP4)
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_F32)
+             GGML_ABORT("fatal error");
+         }
+@@ -581,6 +585,7 @@
+         case GGML_TYPE_Q5_0:
+         case GGML_TYPE_Q4_1:
+         case GGML_TYPE_Q4_0:
++        case GGML_TYPE_MXFP4:   // Strata DS4.1 --kv-fp4
+             return true;
+         default:
+             return false;
+diff -ru a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
+--- a/ggml/src/ggml-cuda/set-rows.cu
++++ b/ggml/src/ggml-cuda/set-rows.cu
+@@ -317,6 +317,26 @@
+             nb1, nb2, nb3,
+             stream
+         );
++    } else if (dst->type == GGML_TYPE_NVFP4) {   // Strata DS4.1 --kv-fp4: exact packing of fake-quantized rows
++        set_rows_cuda_quant<idx_t, block_nvfp4, QK_NVFP4, quantize_f32_nvfp4_ds41_block>(
++            src0_d, src1_d, (block_nvfp4*)dst->data,
++            ne00, ne01, ne02, ne03,
++            ne10, ne11, ne12, ne13,
++            nb01, nb02, nb03,
++            nb10, nb11, nb12,
++            nb1, nb2, nb3,
++            stream
++        );
++    } else if (dst->type == GGML_TYPE_MXFP4) {   // Strata DS4.1 --kv-fp4
++        set_rows_cuda_quant<idx_t, block_mxfp4, QK_MXFP4, quantize_f32_mxfp4_ds41_block>(
++            src0_d, src1_d, (block_mxfp4*)dst->data,
++            ne00, ne01, ne02, ne03,
++            ne10, ne11, ne12, ne13,
++            nb01, nb02, nb03,
++            nb10, nb11, nb12,
++            nb1, nb2, nb3,
++            stream
++        );
+     } else {
+         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
+     }

@@ -1,0 +1,8 @@
+# base currency and units of the base per one unit of each currency
+base: USD
+USD: 1.0000
+EUR: 1.0855
+GBP: 1.2700
+CHF: 1.4000
+JPY: 0.0067
+CAD: 0.7400

@@ -1,0 +1,27 @@
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2566,6 +2566,12 @@
+     bool use_cuda_graph = true;
+     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
+ 
++    // xolotl s6: GGML_CUDA_GRAPH_MAX_TOKENS=N (default 0 = no limit) - a graph whose matrix products take more than N
++    // token columns (a prompt chunk) runs without a CUDA graph. Launch overhead is noise at prompt batch sizes, and
++    // instantiating a prompt chunk's graph needs VRAM the engine has just given to the chunk (GLM: cudaGraphInstantiate
++    // out of memory on a fresh ~30K prompt). Decode (1 token) keeps its graphs.
++    static const int64_t max_tokens = getenv("GGML_CUDA_GRAPH_MAX_TOKENS") ? atoll(getenv("GGML_CUDA_GRAPH_MAX_TOKENS")) : 0;
++
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+ 
+@@ -2573,6 +2579,11 @@
+             continue;
+         }
+ 
++        if (max_tokens > 0 && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[1] &&
++            node->src[1]->ne[1] * (node->op == GGML_OP_MUL_MAT_ID ? node->src[1]->ne[2] : 1) > max_tokens) {
++            use_cuda_graph = false;
++            break;
++        }
+ 
+         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+         if (node->op == GGML_OP_MUL_MAT_ID) {

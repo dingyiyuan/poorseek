@@ -1,0 +1,21 @@
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -1441,7 +1441,17 @@
+     const int ntiles_dst = ntx * nty * ntzw;
+     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
+     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
+-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
++    // Strata-DS4 (tools/v41/ggml/mmq-deterministic.patch): for the MoE products (expert_bounds set) the stream-k split
++    // depends on how many tiles the launch holds, i.e. on which experts share it, so a tile's K sum is cut at different
++    // points when the caller groups experts by free VRAM (Strata's prefill: the prestage region and the transcode
++    // scratch) - the prompt's logits then change with what else is on the card.  One CUDA block per tile keeps every
++    // output's K order fixed.  GGML_CUDA_MMQ_STREAM_K_MOE=1 restores the split.
++    static const bool moe_stream_k = [] {
++        const char * v = getenv("GGML_CUDA_MMQ_STREAM_K_MOE");
++        return v && v[0] == '1';
++    }();
++    const bool tile_only = args.expert_bounds != nullptr && !moe_stream_k;
++    const dim3 block_nums_stream_k(tile_only || (GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90) ? ntiles_dst : nsm, 1, 1);
+ 
+     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
+ 

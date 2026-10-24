@@ -1,0 +1,11 @@
+{
+ "id": "17-cc-stairs",
+ "category": "competitive programming (Codeforces 3400)",
+ "prompt": "Solve the problem in PROBLEM.md by writing solution.py (stdin -> stdout). It is a real Codeforces problem rated 3400; the visible tests are its examples, and the hidden tests are 40 official/generated cases graded token-by-token with a 10 s limit each. Use the tools; when you are done, call submit.",
+ "max_steps": 12,
+ "max_test_runs": 6,
+ "max_python_runs": 12,
+ "grade_timeout": 520,
+ "trap": "(none: no rejected submission in the dataset passes the examples)",
+ "source": "deepmind/code_contests: 1553_I. Stairs"
+}

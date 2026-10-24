@@ -1,0 +1,4 @@
+{"id": "05-regex-engine", "category": "algorithms + performance",
+ "prompt": "Implement fullmatch(pattern, text) in minire.py exactly as its docstring specifies - including the performance requirement. Read the docstring carefully: it is the whole spec, and it is NOT Python's re (three rules are deliberately non-standard and the hidden suite pins every one of them). The hidden suite also fuzzes the part of the syntax whose semantics do coincide with Python's re, runs pathological patterns under a time limit, and checks malformed patterns. You may not import re (or any regex library) in minire.py. Use the tools; when you are done, call submit.",
+ "max_steps": 12, "max_test_runs": 6, "max_python_runs": 12,
+ "trap": "a Python-shaped backtracking matcher - leftmost-first with give-back, '.' excluding newline, '^'/'$' as string anchors, no invented '~' - which passes the visible tests, fails the twisted cases, and hangs on (a*)*b / (a|aa)*c"}

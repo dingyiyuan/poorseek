@@ -1,0 +1,271 @@
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -586,6 +586,7 @@
+         GGML_OP_DSV4_HC_PRE,
+         GGML_OP_DSV4_HC_POST,
+         GGML_OP_DSV41_FAKE_QUANT,
++        GGML_OP_DSV41_HC_MIXES,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2737,6 +2738,19 @@
+             struct ggml_tensor  * a,
+             int                   mode);
+ 
++    // Strata-DS4: the HC pre/post mixes of one model.py Block.hc_mixes in ONE op - the same values as the stock-op
++    // composite tools/v41/engine/ds41_dense.cpp hc_mixes builds (mul, add, sigmoid, ggml_scale / ggml_scale_bias), bit for
++    // bit on CUDA and CPU.  Replaces 4 nodes per mix with 1: 16 of every layer's ~82 tiny kernels.
++    //   mixes: F32 [2*hc, n_tokens] contiguous   scale: F32 [2]   base: F32 [2*hc]   result: F32 [hc, 2*n_tokens]
++    //   result[h, t]        = sigmoid(mixes[h,      t]*scale[0] + base[h])      * 1 + eps   (the pre mix)
++    //   result[h, nt + t]   = sigmoid(mixes[hc + h, t]*scale[1] + base[hc + h]) * 2 + 0     (the post mix)
++    GGML_API struct ggml_tensor * ggml_dsv41_hc_mixes(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * mixes,
++            struct ggml_tensor  * scale,
++            struct ggml_tensor  * base,
++            float                 eps);
++
+     // custom operators
+ 
+     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1085,6 +1085,7 @@
+     "DSV4_HC_PRE",
+     "DSV4_HC_POST",
+     "DSV41_FAKE_QUANT",
++    "DSV41_HC_MIXES",
+ 
+     "UNARY",
+ 
+@@ -1102,7 +1103,7 @@
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1201,6 +1202,7 @@
+     "dsv4_hc_pre(x, weights)",
+     "dsv4_hc_post(x, residual, post, comb)",
+     "dsv41_fake_quant(x)",
++    "dsv41_hc_mixes(mixes, scale, base)",
+ 
+     "unary(x)",
+ 
+@@ -1218,7 +1220,7 @@
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6564,6 +6566,28 @@
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_dsv41_hc_mixes(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * mixes,
++        struct ggml_tensor  * scale,
++        struct ggml_tensor  * base,
++        float                 eps) {
++    GGML_ASSERT(mixes->type == GGML_TYPE_F32 && ggml_is_contiguous(mixes));
++    GGML_ASSERT(scale->type == GGML_TYPE_F32 && ggml_nelements(scale) == 2);
++    GGML_ASSERT(base->type  == GGML_TYPE_F32 && ggml_is_contiguous(base));
++    GGML_ASSERT(base->ne[0] % 2 == 0);
++    const int64_t hc = base->ne[0] / 2;
++    const int64_t nt = mixes->ne[1] * mixes->ne[2] * mixes->ne[3];
++    GGML_ASSERT(mixes->ne[0] >= 2*hc);   // a Block.hc_mixes mixes tensor also carries the hc*hc comb rows after them
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, 2*nt);
++    ggml_set_op_params_f32(result, 0, eps);
++    result->op     = GGML_OP_DSV41_HC_MIXES;
++    result->src[0] = mixes;
++    result->src[1] = scale;
++    result->src[2] = base;
++    return result;
++}
++
+ struct ggml_tensor * ggml_dsv4_hc_pre(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * x,
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -109,6 +109,7 @@
+ void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv41_fake_quant(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_dsv41_hc_mixes(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -12255,3 +12255,41 @@
+         }
+     }
+ }
++
++// ggml_compute_forward_dsv41_hc_mixes (Strata-DS4): the two HC mixes of one model.py Block.hc_mixes.  The same steps,
++// in the same order, as the engine's stock-op composite (ggml_compute_forward_mul -> ggml_vec_mul_f32,
++// ggml_compute_forward_add -> ggml_vec_add_f32, ggml_compute_forward_sigmoid -> ggml_vec_sigmoid_f32,
++// ggml_compute_forward_scale -> ggml_vec_scale_f32 / ggml_vec_mad1_f32): one plain product, one plain sum (volatile:
++// the product must round on its own, GNU mode contracts a*b+c into fma and the composite is two ops), the sigmoid, and
++// s*1 + eps / s*2 + 0 (exactly the scale the composite applies, `fma(x, 1, eps)` == `x + eps`).
++void ggml_compute_forward_dsv41_hc_mixes(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * mixes = dst->src[0];
++    const ggml_tensor * scale = dst->src[1];
++    const ggml_tensor * base  = dst->src[2];
++    GGML_ASSERT(mixes->type == GGML_TYPE_F32 && ggml_is_contiguous(mixes));
++    GGML_ASSERT(scale->type == GGML_TYPE_F32 && ggml_nelements(scale) == 2);
++    GGML_ASSERT(base->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(mixes->ne[0] >= 2 * (base->ne[0] / 2));
++    const int64_t hc = base->ne[0] / 2;
++    const int64_t nt = dst->ne[1] / 2;
++    const int64_t nrow = mixes->ne[0];   // 2*hc; a Block.hc_mixes mixes tensor carries the comb rows after them
++    const float   eps = ggml_get_op_params_f32(dst, 0);
++    const float * mx = (const float *) mixes->data;
++    const float * sc = (const float *) scale->data;
++    const float * bs = (const float *) base->data;
++    float * y = (float *) dst->data;
++    const int64_t n = 2*hc*nt;
++    const int64_t i0 = n * params->ith / params->nth;
++    const int64_t i1 = n * (params->ith + 1) / params->nth;
++    for (int64_t i = i0; i < i1; ++i) {
++        const int64_t h    = i % hc;
++        const int64_t col  = i / hc;
++        const bool    post = col >= nt;
++        const int64_t t    = post ? col - nt : col;
++        const int64_t r    = post ? hc + h : h;
++        const volatile float t0 = mx[r + nrow*t] * sc[post ? 1 : 0];
++        const float t1 = t0 + bs[r];
++        const float s  = 1.0f / (1.0f + expf(-t1));
++        y[i] = post ? s * 2.0f : s + eps;
++    }
++}
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2113,6 +2113,10 @@
+             {
+                 ggml_compute_forward_dsv41_fake_quant(params, tensor);
+             } break;
++        case GGML_OP_DSV41_HC_MIXES:
++            {
++                ggml_compute_forward_dsv41_hc_mixes(params, tensor);
++            } break;
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2297,6 +2301,7 @@
+         case GGML_OP_DSV4_HC_PRE:
+         case GGML_OP_DSV4_HC_POST:
+         case GGML_OP_DSV41_FAKE_QUANT:
++        case GGML_OP_DSV41_HC_MIXES:
+             {
+                 n_tasks = n_threads;
+             } break;
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1038,7 +1038,8 @@
+             case GGML_OP_DSV4_HC_COMB:
+             case GGML_OP_DSV4_HC_PRE:
+             case GGML_OP_DSV4_HC_POST:
+-            case GGML_OP_DSV41_FAKE_QUANT: {
++            case GGML_OP_DSV41_FAKE_QUANT:
++            case GGML_OP_DSV41_HC_MIXES: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+             } break;
+             case GGML_OP_UNARY: {
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2394,6 +2394,9 @@
+         case GGML_OP_DSV41_FAKE_QUANT:
+             ggml_cuda_op_dsv41_fake_quant(ctx, dst);
+             break;
++        case GGML_OP_DSV41_HC_MIXES:
++            ggml_cuda_op_dsv41_hc_mixes(ctx, dst);
++            break;
+         case GGML_OP_RWKV_WKV7:
+             ggml_cuda_op_rwkv_wkv7(ctx, dst);
+             break;
+@@ -5504,6 +5507,9 @@
+                 op->type == GGML_TYPE_F32;
+         case GGML_OP_DSV41_FAKE_QUANT:
+             return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && op->type == GGML_TYPE_F32;
++        case GGML_OP_DSV41_HC_MIXES:
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++                op->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && op->type == GGML_TYPE_F32;
+         case GGML_OP_FLASH_ATTN_EXT:
+             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+--- a/ggml/src/ggml-cuda/dsv4-hc.cu
++++ b/ggml/src/ggml-cuda/dsv4-hc.cu
+@@ -387,3 +387,57 @@
+     }
+     CUDA_CHECK(cudaGetLastError());
+ }
++
++
++// ---- Strata-DS4: GGML_OP_DSV41_HC_MIXES - the two HC mixes of one model.py Block.hc_mixes in one kernel.
++// tools/v41/engine/ds41_dense.cpp hc_mixes builds them from mul + add + sigmoid + ggml_scale(_bias); this repeats that
++// composite step for step under the same -use_fast_math flags, so the values are bit-identical:
++// a stock binary op is one plain op (__fmul_rn / __fadd_rn: .rn.ftz, never contracted, = binbcast's a op b), ggml_scale
++// is scale_f32's `scale * x + bias` = one FMA (__fmaf_rn), sigmoid is unary_op_kernel's op_sigmoid.
++static __device__ __forceinline__ float dsv41_hc_mix_sigmoid(float x) {
++    return 1.0f / (1.0f + expf(-x));
++}
++
++// one thread per output element: dst [hc, 2*nt] = [ pre | post ]
++static __global__ void dsv41_hc_mixes_f32(
++        const float * __restrict__ mixes,
++        const int64_t nrow,                                // mixes->ne[0] = 2*hc (+ hc*hc comb rows the op does not read)
++        const float * __restrict__ scale,
++        const float * __restrict__ base,
++        float * __restrict__ dst,
++        const int64_t hc,
++        const int64_t nt,
++        const float eps) {
++    const int64_t n = 2*hc*nt;
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n) {
++        return;
++    }
++    const int64_t h    = i % hc;
++    const int64_t col  = i / hc;                       // 0..nt-1 = the pre mix, nt..2*nt-1 = the post mix
++    const int64_t post = col >= nt;
++    const int64_t t    = post ? col - nt : col;
++    const int64_t r    = post ? hc + h : h;
++    const float   v    = __fadd_rn(__fmul_rn(mixes[r + nrow*t], scale[post]), base[r]);
++    const float   s    = dsv41_hc_mix_sigmoid(v);
++    dst[i] = post ? __fmaf_rn(2.0f, s, 0.0f) : __fmaf_rn(1.0f, s, eps);
++}
++
++void ggml_cuda_op_dsv41_hc_mixes(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * mixes = dst->src[0];
++    const ggml_tensor * scale = dst->src[1];
++    const ggml_tensor * base  = dst->src[2];
++    GGML_ASSERT(mixes->type == GGML_TYPE_F32 && ggml_is_contiguous(mixes));
++    GGML_ASSERT(scale->type == GGML_TYPE_F32 && ggml_nelements(scale) == 2);
++    GGML_ASSERT(base->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->ne[1] % 2 == 0 && mixes->ne[0] >= dst->ne[0] * 2);
++    const int64_t hc = base->ne[0] / 2;
++    const int64_t nt = dst->ne[1] / 2;
++    const float   eps = ggml_get_op_params_f32(dst, 0);
++    const int64_t n = 2*hc*nt;
++    const int64_t blocks = (n + 255) / 256;
++    cudaStream_t stream = ctx.stream();
++    dsv41_hc_mixes_f32<<<blocks, 256, 0, stream>>>((const float *) mixes->data, mixes->ne[0], (const float *) scale->data,
++                                                   (const float *) base->data, (float *) dst->data, hc, nt, eps);
++    CUDA_CHECK(cudaGetLastError());
++}
+--- a/ggml/src/ggml-cuda/dsv4-hc.cuh
++++ b/ggml/src/ggml-cuda/dsv4-hc.cuh
+@@ -5,3 +5,4 @@
+ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_dsv41_fake_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_dsv41_hc_mixes(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

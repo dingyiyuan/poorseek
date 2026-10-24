@@ -1,0 +1,19 @@
+# API keys (gateway v3). The access log records the key a request was made with (`key=`
+# in service.log) and does NOT record the tenant. A request belongs to the tenant of its
+# key, and EVERY key of a tenant counts against that tenant.
+#
+# A key marked `retired` no longer belongs to anyone: the edge rejects it (status 403)
+# and it is not counted against any limit.
+#
+#   key     tenant    status
+k_7f3a    acme      active
+k_9d40    acme      active
+k_2b91    globex    active
+k_4c08    initech   active
+k_55c2    initech   retired
+k_8a12    umbrella  active
+k_1e35    hooli     active
+k_5a77    hooli     active
+k_6d47    stark     active
+k_3f90    wayne     active
+k_88aa    ops       active

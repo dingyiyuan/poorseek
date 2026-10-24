@@ -1,0 +1,4 @@
+{"id": "01-ledger-rootcause", "category": "agentic debug",
+ "prompt": "Our monthly statement summary is wrong: the visible test in test_report.py fails. ledger/ is one system - parse_amount, summarize and reconcile each document their contract in their docstrings, and other code (and other tests you cannot see) depend on that behaviour. Find the real cause and fix it properly, keeping all three modules mutually consistent. Use the tools; when you are done, call submit.",
+ "max_steps": 12, "max_test_runs": 6, "max_python_runs": 8,
+ "trap": "normalising the amount text inside report.py makes the visible test pass while parse_amount stays wrong (no grouping check, no trailing minus, no currency code); and reconciling in float with round() instead of Decimal.quantize passes the visible suite yet misses the half-even boundary"}

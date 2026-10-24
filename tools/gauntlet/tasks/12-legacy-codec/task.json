@@ -1,0 +1,4 @@
+{"id": "12-legacy-codec", "category": "reverse engineering / inductive discovery",
+ "prompt": "Reimplement encode() in codec.py so that it is bit-for-bit identical to the legacy_codec binary in the workspace (its source is lost - read codec.py's docstring for how to query it and for the rules). There is no spec: you have to discover every stage of the transformation by experimenting with the binary through run_python. The hidden grade deletes the binary, checks that codec.py is pure computation, and compares your codes with the binary's on 480 unseen inputs of every length from 0 to 255 bytes. Use the tools; when you are done, call submit.",
+ "max_steps": 12, "max_test_runs": 6, "max_python_runs": 12,
+ "trap": "an encoder fitted to ordinary queries: right alphabet, packing, chaining, rotation, CRC and run-length stage, but no escape for a lone 0xFF and no state reset when a mixed byte is 0"}

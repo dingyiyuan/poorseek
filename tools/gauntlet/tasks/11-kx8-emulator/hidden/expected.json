@@ -1,0 +1,380 @@
+{
+"arith_flags": {
+"status": "HALT",
+"pc": 226,
+"sp": 0,
+"regs": [
+0,
+3855,
+4080,
+0,
+0,
+0,
+0,
+8
+],
+"flags": "--C-",
+"steps": 90,
+"output": "2\n8\n-2\n2\n-32768\n12\n-32768\n6\n0\n9\n0\n9\n7\n9\n-1\n2\n-1\n2\n0\n13\n-32768\n6\n-32768\n9\n-4661\n10\n3855\n8\n"
+},
+"multiword_carry": {
+"status": "HALT",
+"pc": 182,
+"sp": 0,
+"regs": [
+0,
+65535,
+2,
+1,
+0,
+1,
+65535,
+0
+],
+"flags": "----",
+"steps": 69,
+"output": "9\n0\n4\n0\n2\n8\n2\n-1\n7\n8\n-1\n2\n-32768\n6\n32767\n12\n1\n0\n"
+},
+"div_semantics": {
+"status": "HALT",
+"pc": 270,
+"sp": 0,
+"regs": [
+0,
+0,
+14,
+2,
+7,
+0,
+0,
+65529
+],
+"flags": "-Z--",
+"steps": 107,
+"output": "3\n1\n0\n-3\n-1\n2\n-3\n1\n2\n3\n-1\n0\n-32768\n0\n6\n0\n1\n1\n0\n-1\n1\n-16384\n0\n2\n-32767\n0\n2\n0\n0\n1\n-1\n0\n2\n14\n2\n0\n-7\n0\n0\n0\n"
+},
+"divzero_fault": {
+"status": "DIVZERO",
+"pc": 18,
+"sp": 65534,
+"regs": [
+0,
+1234,
+0,
+0,
+0,
+0,
+0,
+0
+],
+"flags": "-ZC-",
+"steps": 5,
+"output": ""
+},
+"branch_matrix": {
+"status": "HALT",
+"pc": 1794,
+"sp": 0,
+"regs": [
+0,
+0,
+32768,
+0,
+0,
+1,
+0,
+0
+],
+"flags": "N--V",
+"steps": 449,
+"output": "1\n0\n1\n0\n0\n1\n0\n1\n0\n1\n0\n1\n1\n0\n0\n1\n1\n0\n0\n1\n0\n1\n0\n1\n0\n1\n1\n0\n1\n0\n0\n1\n1\n0\n0\n1\n0\n1\n0\n1\n0\n1\n1\n0\n1\n0\n0\n1\n0\n1\n0\n1\n0\n1\n1\n0\n0\n1\n1\n0\n1\n0\n0\n1\n"
+},
+"shifts_rotates": {
+"status": "HALT",
+"pc": 318,
+"sp": 0,
+"regs": [
+0,
+32768,
+0,
+0,
+0,
+0,
+0,
+10
+],
+"flags": "N-C-",
+"steps": 120,
+"output": "2\n8\n0\n9\n9024\n8\n16384\n8\n1\n0\n-1\n2\n-16384\n10\n4096\n8\n0\n9\n-32768\n2\n0\n9\n1\n8\n-16384\n2\n4660\n0\n-5\n10\n-32768\n10\n"
+},
+"mul_words": {
+"status": "HALT",
+"pc": 140,
+"sp": 0,
+"regs": [
+0,
+0,
+0,
+0,
+9,
+0,
+2,
+1
+],
+"flags": "-Z--",
+"steps": 55,
+"output": "24464\n1\n12\n1\n-2\n14\n-2\n1\n12\n16960\n77\n12\n0\n1\n0\n4096\n12\n1\n"
+},
+"recursive_fib": {
+"status": "HALT",
+"pc": 12,
+"sp": 0,
+"regs": [
+0,
+17,
+1597,
+987,
+0,
+0,
+0,
+0
+],
+"flags": "----",
+"steps": 41336,
+"output": "1597\n"
+},
+"self_modifying": {
+"status": "HALT",
+"pc": 44,
+"sp": 0,
+"regs": [
+0,
+1,
+0,
+0,
+0,
+0,
+0,
+0
+],
+"flags": "-ZC-",
+"steps": 40,
+"output": "100\n107\n114\n121\n128\n"
+},
+"memory_endian_wrap": {
+"status": "HALT",
+"pc": 90,
+"sp": 0,
+"regs": [
+0,
+23130,
+92,
+30583,
+0,
+65535,
+92,
+0
+],
+"flags": "----",
+"steps": 27,
+"output": "18\n52\n205\n90\n90\n23130\n23168\n30583\n"
+},
+"illegal_op": {
+"status": "ILLEGAL",
+"pc": 10,
+"sp": 0,
+"regs": [
+0,
+0,
+0,
+0,
+0,
+0,
+0,
+0
+],
+"flags": "-ZC-",
+"steps": 3,
+"output": "\u0003"
+},
+"illegal_high_op": {
+"status": "ILLEGAL",
+"pc": 6,
+"sp": 0,
+"regs": [
+0,
+0,
+66,
+0,
+0,
+0,
+0,
+0
+],
+"flags": "----",
+"steps": 2,
+"output": "B"
+},
+"step_limit": {
+"status": "LIMIT",
+"pc": 4,
+"sp": 0,
+"regs": [
+0,
+500,
+0,
+0,
+0,
+0,
+0,
+0
+],
+"flags": "----",
+"steps": 1001,
+"output": ""
+},
+"step_limit_zero": {
+"status": "LIMIT",
+"pc": 0,
+"sp": 0,
+"regs": [
+0,
+0,
+0,
+0,
+0,
+0,
+0,
+0
+],
+"flags": "----",
+"steps": 0,
+"output": ""
+},
+"r0_hardwired": {
+"status": "HALT",
+"pc": 64,
+"sp": 0,
+"regs": [
+0,
+0,
+0,
+0,
+0,
+0,
+0,
+2
+],
+"flags": "N---",
+"steps": 27,
+"output": "0\n0\n0\n0\n0\n9\n2\n2\n"
+},
+"jump_table": {
+"status": "HALT",
+"pc": 54,
+"sp": 0,
+"regs": [
+0,
+8,
+26,
+52,
+0,
+0,
+0,
+0
+],
+"flags": "-ZC-",
+"steps": 34,
+"output": "cabc"
+},
+"output_format": {
+"status": "HALT",
+"pc": 38,
+"sp": 0,
+"regs": [
+0,
+45,
+0,
+0,
+0,
+0,
+0,
+0
+],
+"flags": "----",
+"steps": 13,
+"output": "A\n-1\n-32768\n32767\n-"
+},
+"popf_branches": {
+"status": "HALT",
+"pc": 80,
+"sp": 0,
+"regs": [
+0,
+6,
+1,
+0,
+0,
+0,
+0,
+0
+],
+"flags": "N--V",
+"steps": 18,
+"output": "1\n"
+},
+"sieve_4000": {
+"status": "HALT",
+"pc": 116,
+"sp": 0,
+"regs": [
+0,
+4000,
+1,
+4026,
+0,
+3989,
+550,
+30467
+],
+"flags": "-ZC-",
+"steps": 68350,
+"output": "550\n30467\n3989\n"
+},
+"stack_wrap": {
+"status": "HALT",
+"pc": 38,
+"sp": 2,
+"regs": [
+0,
+4369,
+4369,
+4369,
+2176,
+65532,
+0,
+0
+],
+"flags": "----",
+"steps": 15,
+"output": "4369\n2176\n-4\n"
+},
+"collatz_600": {
+"status": "HALT",
+"pc": 106,
+"sp": 0,
+"regs": [
+0,
+600,
+1,
+118,
+0,
+1,
+143,
+327
+],
+"flags": "-ZC-",
+"steps": 341340,
+"output": "327\n143\n"
+}
+}

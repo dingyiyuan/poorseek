@@ -1,0 +1,19 @@
+# Rate limits (gateway v3). Read every line: the limits are documented only here.
+#
+# COUNTED. A request is COUNTED unless it is one of
+#   * a request of tenant `ops`                      (operations traffic is never limited),
+#   * a request to the path `/health`                (health probes are not API traffic),
+#   * a request made with an API key whose status is `retired` in api_keys.txt
+#                                                    (rejected at the edge, never reaches the limiter),
+#   * a request covered by an exemption in exemptions.txt.
+# Everything else counts - including requests the gateway rejected with 429, and every
+# 4xx/5xx that is not listed above.
+#
+# A window is HALF-OPEN: [t, t + window_s). A request that is the (limit + 1)-th COUNTED
+# request inside some window breaks that limit.
+#
+# A request that breaks ANY limit below is a VIOLATION.
+rate_limit:
+  window_s: 10                # one second-resolution window length for every limit
+  per_tenant: 5               # counted requests of ONE tenant, per window
+  global_per_window: 17       # counted requests of ALL tenants together, per window

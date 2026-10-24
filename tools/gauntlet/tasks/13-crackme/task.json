@@ -1,0 +1,10 @@
+{
+ "id": "13-crackme",
+ "category": "reverse engineering / binary analysis",
+ "prompt": "The workspace holds a stripped x86-64 Linux binary, crackme, that checks a licence key given as its single argument (32 hex digits) and prints ACCEPTED or REJECTED. Exactly one key is accepted (up to letter case). Find it: analyse the binary with whatever run_python can drive (objdump, readelf, gdb and strace are on PATH; there is no source), invert its check, and confirm your key with the binary itself. Your FINAL message must contain the accepted key and no other 32-hex-digit string. Use the tools; when you are done, call submit.",
+ "max_steps": 12,
+ "max_test_runs": 0,
+ "max_python_runs": 12,
+ "answer": "(?is)^(?!.*\\b[0-9a-f]{32}\\b.*\\b[0-9a-f]{32}\\b).*\\bb254dfc02e3bfe29293ffa41bc69e091\\b",
+ "trap": "the key read straight from the Feistel inversion without undoing the nibble permutation of the parse (the binary REJECTS it)"
+}

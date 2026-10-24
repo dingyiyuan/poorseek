@@ -1,15 +1,12 @@
-# GitHub Linguist overrides.
-# `.comp` is our Vulkan compute-shader source (the bulk of the GPU kernels), but
-# Linguist doesn't classify it, so ~312 KB of shader code fell out of the language
-# stats — making Metal look larger than the Vulkan shaders when the reverse is true.
-*.comp linguist-language=GLSL
-scripts/perf-sweep.sh text eol=lf
-Start-INFR-Wizard-Linux.sh text eol=lf
-scripts/smoke-linux-wizard.sh text eol=lf
-scripts/install-shaderc-linux.sh text eol=lf
-scripts/test-linux-wizard.sh text eol=lf
-scripts/build-image-codecs.py text eol=lf
-scripts/linux_release.py text eol=lf
-scripts/test_linux_tools.py text eol=lf
-# Keep published experiment checksums stable in Windows checkouts.
-documentation/evidence/campaigns/qwen38/assets/expert-omission-20261011/* text eol=lf
+# Frozen prompts are hashed byte for byte (manifest sha256): never convert their line endings.
+bench/prompts/** -text
+
+# launchers keep their platform line endings wherever the repository is cloned
+*.sh text eol=lf
+*.bat text eol=crlf
+
+# copies of real packs' native_experts.txt, parsed byte for byte by tests/core/expert_layout_test.cpp
+tests/data/native_experts/** -text
+
+# the quant yardstick's text set: tokenized byte for byte (set.ids.json), never convert its line endings
+data/quant_quality/** -text

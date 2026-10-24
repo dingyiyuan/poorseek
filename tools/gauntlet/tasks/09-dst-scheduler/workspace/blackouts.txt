@@ -1,0 +1,5 @@
+# Desk closures: LOCAL calendar dates in the zone being scheduled.
+# One YYYY-MM-DD per line; "#" starts a comment; blank lines are ignored.
+2026-01-01      # New Year's Day
+2026-06-11      # the desk is shut for the day
+2026-12-25      # Christmas Day

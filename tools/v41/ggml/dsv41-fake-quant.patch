@@ -1,0 +1,291 @@
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -585,6 +585,7 @@
+         GGML_OP_DSV4_HC_COMB,
+         GGML_OP_DSV4_HC_PRE,
+         GGML_OP_DSV4_HC_POST,
++        GGML_OP_DSV41_FAKE_QUANT,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2726,6 +2727,16 @@
+             struct ggml_tensor  * post,
+             struct ggml_tensor  * comb);
+ 
++    // Strata-DS4: DeepSeek-V4.1's activation quantize-dequantize (model.py act_quant / fp4_act_quant) in one op, the
++    // same values as the stock-op composite tools/v41/engine/ds41_ops.hpp ds41_fake_quant builds (bit for bit on CUDA):
++    //   mode 0: FP8 E4M3, blocks of 32, power-of-two scale     mode 1: FP4 E2M1, blocks of 16, E4M3 scale
++    //   mode 2: FP4 E2M1, blocks of 32, power-of-two scale
++    // a: F32, contiguous, ggml_nelements(a) % block == 0; result: a's shape
++    GGML_API struct ggml_tensor * ggml_dsv41_fake_quant(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            int                   mode);
++
+     // custom operators
+ 
+     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1084,6 +1084,7 @@
+     "DSV4_HC_COMB",
+     "DSV4_HC_PRE",
+     "DSV4_HC_POST",
++    "DSV41_FAKE_QUANT",
+ 
+     "UNARY",
+ 
+@@ -1101,7 +1102,7 @@
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1199,6 +1200,7 @@
+     "dsv4_hc_comb(mixes, scale, base)",
+     "dsv4_hc_pre(x, weights)",
+     "dsv4_hc_post(x, residual, post, comb)",
++    "dsv41_fake_quant(x)",
+ 
+     "unary(x)",
+ 
+@@ -1216,7 +1218,7 @@
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6545,6 +6547,20 @@
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_dsv41_fake_quant(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        int                   mode) {
++    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
++    GGML_ASSERT(mode >= 0 && mode <= 2);
++    GGML_ASSERT(ggml_nelements(a) % (mode == 1 ? 16 : 32) == 0);
++    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
++    ggml_set_op_params_i32(result, 0, mode);
++    result->op     = GGML_OP_DSV41_FAKE_QUANT;
++    result->src[0] = a;
++    return result;
++}
++
+ struct ggml_tensor * ggml_dsv4_hc_pre(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * x,
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -108,6 +108,7 @@
+ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_dsv41_fake_quant(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -12204,3 +12204,54 @@
+         }
+     }
+ }
++
++// ggml_compute_forward_dsv41_fake_quant (Strata-DS4): DeepSeek-V4.1's activation quantize-dequantize, the same steps as
++// tools/v41/engine/ds41_ops.hpp (exact float tricks: Veltkamp power-of-two split, round-half-even by 1.5 * 2^23)
++
++static inline float dsv41_pow2_ceil(float a) {
++    // volatile: the split needs the ROUNDED product - contracted into fma(-a, c, a) (GNU mode, -march=native) it is
++    // not a split at all
++    const volatile float g = a * 8388609.0f;
++    const float hi = g + (a - g);
++    return hi * ((a - hi > 0.0f ? 1.0f : 0.0f) + 1.0f);
++}
++
++static inline float dsv41_pow2_floor(float a) {
++    const float f = dsv41_pow2_ceil(a);
++    return f * ((f - a > 0.0f ? 1.0f : 0.0f) * -0.5f + 1.0f);
++}
++
++static inline float dsv41_round_fmt(float v, int mbits, float min_normal) {
++    const float p = fminf(fmaxf(dsv41_pow2_floor(fabsf(v)), min_normal), INFINITY);
++    const float k = (float) (1 << mbits);
++    const float C = 12582912.0f;
++    const float y = (v / p) * k;
++    const volatile float yc = y + C;   // round half to even: the add must round on its own
++    const float r = yc - C;
++    return (r * (1.0f / k)) * p;
++}
++
++void ggml_compute_forward_dsv41_fake_quant(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src0));
++    const int mode = ggml_get_op_params_i32(dst, 0);
++    const int bs = mode == 1 ? 16 : 32;
++    const bool fp8 = mode == 0;
++    const float maxv = fp8 ? 448.0f : 6.0f;
++    const float floor_ = fp8 ? 1e-4f : mode == 1 ? 6.0f / 512.0f : 6.0f * 0x1p-126f;
++    const int64_t nb = ggml_nelements(src0) / bs;
++    const int64_t b0 = nb * params->ith / params->nth, b1 = nb * (params->ith + 1) / params->nth;
++    const float * x = (const float *) src0->data;
++    float * y = (float *) dst->data;
++    for (int64_t b = b0; b < b1; ++b) {
++        float amax = -FLT_MAX;
++        for (int i = 0; i < bs; ++i) amax = fmaxf(amax, fabsf(x[b * bs + i]));
++        const float t = fminf(fmaxf(amax, floor_), INFINITY) / maxv;
++        const float s = mode == 1 ? dsv41_round_fmt(t, 3, 0x1p-6f) : dsv41_pow2_ceil(t);
++        for (int i = 0; i < bs; ++i) {
++            const float v = fminf(fmaxf(x[b * bs + i] / s, -maxv), maxv);
++            const float q = fp8 ? dsv41_round_fmt(v, 3, 0x1p-6f) : dsv41_round_fmt(v, 1, 1.0f);
++            y[b * bs + i] = q * s;
++        }
++    }
++}
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2109,6 +2109,10 @@
+             {
+                 ggml_compute_forward_dsv4_hc_post(params, tensor);
+             } break;
++        case GGML_OP_DSV41_FAKE_QUANT:
++            {
++                ggml_compute_forward_dsv41_fake_quant(params, tensor);
++            } break;
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2292,6 +2296,7 @@
+         case GGML_OP_DSV4_HC_COMB:
+         case GGML_OP_DSV4_HC_PRE:
+         case GGML_OP_DSV4_HC_POST:
++        case GGML_OP_DSV41_FAKE_QUANT:
+             {
+                 n_tasks = n_threads;
+             } break;
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1037,7 +1037,8 @@
+             } break;
+             case GGML_OP_DSV4_HC_COMB:
+             case GGML_OP_DSV4_HC_PRE:
+-            case GGML_OP_DSV4_HC_POST: {
++            case GGML_OP_DSV4_HC_POST:
++            case GGML_OP_DSV41_FAKE_QUANT: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+             } break;
+             case GGML_OP_UNARY: {
+--- a/ggml/src/ggml-cuda/dsv4-hc.cu
++++ b/ggml/src/ggml-cuda/dsv4-hc.cu
+@@ -314,3 +314,76 @@
+             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
+             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
+ }
++
++
++// ---- Strata-DS4: GGML_OP_DSV41_FAKE_QUANT - DeepSeek-V4.1's activation quantize-dequantize in one kernel.
++// tools/v41/engine/ds41_ops.hpp builds it from ~45 stock ops per call (abs, pool max, clamp, div, scale, step, ...);
++// this repeats that composite step for step under the same -use_fast_math flags, so the values are bit-identical:
++// a stock binary op is one plain op (__fadd_rn / __fsub_rn / __fmul_rn: .rn.ftz, never contracted, = binbcast's
++// a op b), division is '/' (div.approx.ftz, = binbcast's op_div), ggml_scale is scale_f32's `scale * x + bias` = one
++// FMA (__fmaf_rn), abs = fabsf, step = x > 0, clamp = fminf(fmaxf), the pool's max = fmaxf over the block.
++
++static __device__ __forceinline__ float dsv41_fq_scale(float x, float s, float b) { return __fmaf_rn(s, x, b); }
++static __device__ __forceinline__ float dsv41_fq_step(float x) { return x > 0.0f ? 1.0f : 0.0f; }
++static __device__ __forceinline__ float dsv41_fq_clamp(float x, float lo, float hi) { return fminf(fmaxf(x, lo), hi); }
++
++static __device__ __forceinline__ float dsv41_fq_pow2_ceil(float a) {
++    const float g  = dsv41_fq_scale(a, 8388609.0f, 0.0f);                 // a * (2^23 + 1)
++    const float hi = __fadd_rn(g, __fsub_rn(a, g));                        // a rounded to 1 significant bit
++    return __fmul_rn(hi, dsv41_fq_scale(dsv41_fq_step(__fsub_rn(a, hi)), 1.0f, 1.0f));
++}
++
++static __device__ __forceinline__ float dsv41_fq_pow2_floor(float a) {
++    const float f = dsv41_fq_pow2_ceil(a);
++    return __fmul_rn(f, dsv41_fq_scale(dsv41_fq_step(__fsub_rn(f, a)), -0.5f, 1.0f));
++}
++
++static __device__ __forceinline__ float dsv41_fq_round_fmt(float v, int mbits, float min_normal) {
++    const float p = dsv41_fq_clamp(dsv41_fq_pow2_floor(fabsf(v)), min_normal, INFINITY);
++    const float k = (float) (1 << mbits);
++    const float C = 12582912.0f;                                           // 1.5 * 2^23: round half to even
++    const float y = dsv41_fq_scale(v / p, k, 0.0f);
++    const float r = dsv41_fq_scale(dsv41_fq_scale(y, 1.0f, C), 1.0f, -C);
++    return __fmul_rn(dsv41_fq_scale(r, 1.0f / k, 0.0f), p);
++}
++
++// one thread per element; a block of BS elements = BS consecutive lanes (n % BS == 0, so a lane group is wholly in or
++// wholly out of range and every lane takes part in the shuffles)
++template <int BS>
++static __global__ void dsv41_fake_quant_f32(const float * __restrict__ x, float * __restrict__ y, const int64_t n,
++                                            const int mode, const float maxv, const float floor_) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    const float xi = i < n ? x[i] : 0.0f;
++    float a = i < n ? fabsf(xi) : -FLT_MAX;
++#pragma unroll
++    for (int o = BS / 2; o > 0; o >>= 1) {
++        a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, o, BS));
++    }
++    if (i >= n) {
++        return;
++    }
++    const float t = dsv41_fq_clamp(a, floor_, INFINITY) / maxv;
++    const float s = mode == 1 ? dsv41_fq_round_fmt(t, 3, 0x1p-6f) : dsv41_fq_pow2_ceil(t);
++    const float v = dsv41_fq_clamp(xi / s, -maxv, maxv);
++    const float q = mode == 0 ? dsv41_fq_round_fmt(v, 3, 0x1p-6f) : dsv41_fq_round_fmt(v, 1, 1.0f);
++    y[i] = __fmul_rn(q, s);
++}
++
++void ggml_cuda_op_dsv41_fake_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src0));
++    const int mode = ggml_get_op_params_i32(dst, 0);
++    const int64_t n = ggml_nelements(src0);
++    const float maxv = mode == 0 ? 448.0f : 6.0f;
++    const float floor_ = mode == 0 ? 1e-4f : mode == 1 ? 6.0f / 512.0f : 6.0f * 0x1p-126f;
++    const int64_t blocks = (n + 255) / 256;
++    cudaStream_t stream = ctx.stream();
++    if (mode == 1) {
++        GGML_ASSERT(n % 16 == 0);
++        dsv41_fake_quant_f32<16><<<blocks, 256, 0, stream>>>((const float *) src0->data, (float *) dst->data, n, mode, maxv, floor_);
++    } else {
++        GGML_ASSERT(n % 32 == 0);
++        dsv41_fake_quant_f32<32><<<blocks, 256, 0, stream>>>((const float *) src0->data, (float *) dst->data, n, mode, maxv, floor_);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
+--- a/ggml/src/ggml-cuda/dsv4-hc.cuh
++++ b/ggml/src/ggml-cuda/dsv4-hc.cuh
+@@ -4,3 +4,4 @@
+ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_dsv41_fake_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2391,6 +2391,9 @@
+         case GGML_OP_DSV4_HC_POST:
+             ggml_cuda_op_dsv4_hc_post(ctx, dst);
+             break;
++        case GGML_OP_DSV41_FAKE_QUANT:
++            ggml_cuda_op_dsv41_fake_quant(ctx, dst);
++            break;
+         case GGML_OP_RWKV_WKV7:
+             ggml_cuda_op_rwkv_wkv7(ctx, dst);
+             break;
+@@ -5499,6 +5502,8 @@
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
+                 op->type == GGML_TYPE_F32;
++        case GGML_OP_DSV41_FAKE_QUANT:
++            return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && op->type == GGML_TYPE_F32;
+         case GGML_OP_FLASH_ATTN_EXT:
+             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+         case GGML_OP_CROSS_ENTROPY_LOSS:

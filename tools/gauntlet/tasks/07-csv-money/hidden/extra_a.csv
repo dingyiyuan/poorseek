@@ -1,0 +1,27 @@
+date,account,description,amount
+2026-07-20,CHK-001,"Rent, October",-0.05 JPY
+2026-09-07,SAV-002,Transfer,"3,227.21 CAD"
+2026-08-11,CRD-003,Fee; monthly,0.03 USD
+2026-08-14,BIZ-004,"Refund ""dup""","5,473.91 USD"
+2026-07-27,BIZ-004,"Refund ""dup""","8,040.67 EUR"
+2026-08-05,CHK-001,"Refund ""dup""",0.01 CAD
+2026-07-23,BIZ-004,Coffee,"2,451.22 USD"
+2026-10-28,BIZ-004,"Rent, October","7,803.86 USD"
+2026-09-06,CHK-001,"Rent, October","-2,152.39 USD"
+2026-10-04,BIZ-004,Coffee,-537.73 CAD
+2026-08-05,CRD-003,"Rent, October","7,550.15 EUR"
+2026-09-14,CRD-003,"Rent, October",0.00 JPY
+2026-10-21,CRD-003,"Rent, October","-1,558.44 USD"
+2026-07-11,BIZ-004,"Wire
+ref 99",-587.78 EUR
+2026-09-22,CRD-003,"Rent, October","6,581.53 CAD"
+2026-07-24,SAV-002,"Refund ""dup""","1,099.13 CAD"
+2026-10-17,SAV-002,Fee; monthly,-809.96 EUR
+2026-08-11,CHK-001,ATM,-0.01 USD
+2026-10-12,CHK-001,"Wire
+ref 99","1,243.13 USD"
+2026-09-14,CHK-001,Fee; monthly,"4,419.40 GBP"
+2026-07-02,CHK-001,"Refund ""dup""","-2,475.91 CAD"
+2026-09-02,SAV-002,ATM,"7,728.90 EUR"
+2026-08-04,CHK-001,Salary,"7,761.73 JPY"
+2026-08-22,BIZ-004,"Rent, October","7,287.10 EUR"
