@@ -558,4 +558,12 @@ private:
 bool ds41_moe_cpu_expert(const cpu::NativeFmt& f, int64_t n_embd, int64_t n_ff, const uint8_t* blob,
                         const float* x, float* out, cpu::ExpertPool& pool);
 
+/// DS41_DEC_PROF=1 (diagnostic, inert when unset): print the decode step's expert-tier table - layer calls, kernel
+/// launches (the per-format-class grouped expert launches of the three sites, the activation quantize and the
+/// per-token weighted-sum kernel), the DEVICE span of the expert launches (an event pair recorded around them and
+/// read only after this call's own sum sync, i.e. when the pair is complete - a pending pair returning
+/// cudaErrorNotReady is counted, never taken as 0 ms) and of the sum kernel, plus the host wall split from
+/// DS4_TIER_PROF.  `n_layers` converts a per-layer-call figure to the per-token one (40 for this model).
+void ds41_moe_decprof_report(const char * tag, int n_layers);
+
 }  // namespace strata::v41

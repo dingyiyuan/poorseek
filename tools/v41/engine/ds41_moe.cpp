@@ -394,7 +394,7 @@ struct Gpu {
     uint8_t* h_fstage = nullptr;       ///< run(): file-tier misses read here (pinned), then DMA'd (kMaxFg blobs)
     void *d_x = nullptr, *d_xq = nullptr, *d_parts = nullptr, *d_grp_ptr = nullptr, *d_grp_start = nullptr,
          *d_ngroups = nullptr, *d_ent_dst = nullptr, *d_ent_tok = nullptr, *d_scratch = nullptr, *d_stage = nullptr;
-    cudaEvent_t ev[4] = {};
+    cudaEvent_t ev[6] = {};           ///< [0] activation, [2] hits launched, [3] PCIe launched, [4]/[5] DS41_DEC_PROF spans
     void* d_pf = nullptr;         ///< kMaxPf staging slots, one expert blob each
     cudaStream_t s_pf = nullptr;  ///< the prefetch stream (never the main one: the DMAs run under the dense work)
     cudaEvent_t ev_pf = nullptr;
@@ -408,11 +408,13 @@ struct Gpu {
     /// split into two banks of `d3_bank` slots; waves alternate banks.  Events: dn_ev[0] = the cross-call barrier (`s`
     /// -> s_dn, once per call), dn_ev[1] = "this wave's copies are home" (s_dn -> `s`, before each wave's launch),
     /// dn_ev[2 + b] = "the kernels that read bank b are done" (`s` -> s_dn, before the bank is written again).
-    /// Off (s_dn null) = the single-stream path, unchanged.  Not s_dc: that is gpu_run's opt-in overlap.
+    /// Armed by `d3_bank > 0` (off = the single-stream path, unchanged).  The STREAM is shared plumbing: the chunk
+    /// path's blob H2D (STRATA_CHUNK_COPY_STREAM, default on) uses it too, so it and its four events are created
+    /// together by gpu_dn_stream whichever feature gets there first.  Not s_dc: that is gpu_run's opt-in overlap.
     cudaStream_t s_dn = nullptr;
     cudaEvent_t dn_ev[4] = {};
     int n_stage = 0;    ///< blobs d_stage holds: max(kMaxParts, STRATA_D3_STAGE_SLOTS); gpu_run uses the first kMaxParts
-    int d3_bank = 0;    ///< s_dn on: slots per bank, min(kMaxParts, STRATA_D3_STAGE_SLOTS / 2)
+    int d3_bank = 0;    ///< != 0 = the D3 banked discipline is armed: slots per bank, min(kMaxParts, D3_STAGE_SLOTS / 2)
     uint8_t* h_dummy = nullptr;   ///< pinned zero blob: a guess outside the arena still costs its DMA
     float* h_x = nullptr;         ///< pinned host copy of x (the H2D source and the CPU tier's input)
     void* h_parts = nullptr;      ///< pinned D2H landing pad for the expert outputs
@@ -659,6 +661,21 @@ struct RemoteTier {
             if (p) cudaFreeHost(p);
     }
 };
+
+/// The copy stream `s_dn` and the four events the D3 discipline records on are ONE unit, and this is the only place
+/// they are created.  Two features want that stream: STRATA_D3_DMA_STREAM (gpu_run_n_ex's banked PCIe copies, which
+/// also owns d3_bank and its two banks of d_stage slots) and STRATA_CHUNK_COPY_STREAM (the chunk path's blob H2D, on
+/// by default).  They used to create it separately - the D3 block made stream + events, the chunk block made the
+/// stream alone - so with the chunk stream at its default `s_dn` existed while dn_ev[0..3] were still null, and the
+/// first gpu_run_n_ex of a decode showed it: `ds4_moe: d3 dn barrier record: invalid resource handle` (the record on
+/// the null event fails first; the wait on it is what follows).  Whoever is first now creates the stream and its
+/// events together, and the second one finds them and only reuses them, so the two paths agree no matter which one
+/// initialises the stream.  The per-element test makes a repeat call a no-op.
+static void gpu_dn_stream(Gpu& gp) {
+    if (!gp.s_dn) ck(cudaStreamCreateWithFlags(&gp.s_dn, cudaStreamNonBlocking), "d3 dn stream");
+    for (cudaEvent_t& e : gp.dn_ev)
+        if (!e) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "d3 dn event");
+}
 
 #else
 
@@ -2018,7 +2035,9 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
     // STRATA_D3_DMA_STREAM=1 (default off): gpu_run_n_ex's PCIe site copies on a stream of their own (Gpu::s_dn), into
     // two banks of staging slots.  STRATA_D3_STAGE_SLOTS=N: the d_stage slots (default kMaxParts, 2 * kMaxParts with
     // the stream on); d_stage holds max(kMaxParts, N) blobs, and gpu_run (and the stream-off path) use the first
-    // kMaxParts as before.
+    // kMaxParts as before.  `d3_bank > 0` is what ARMS the discipline in gpu_run_n_ex (see its `dn`): the stream
+    // itself is shared with the chunk path, the banks are not.  gpu_dn_stream is the one place stream + events are
+    // made, so this block and the chunk path's cannot leave the other with half the pair.
     {
         const char* dn = std::getenv("STRATA_D3_DMA_STREAM");
         const bool dn_on = dn && dn[0] == '1';
@@ -2027,13 +2046,13 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
         gp.n_stage = std::max(kMaxParts, want);
         if (dn_on) {
             gp.d3_bank = std::max(1, std::min(kMaxParts, want / 2));
-            if (!gp.s_dn) ck(cudaStreamCreateWithFlags(&gp.s_dn, cudaStreamNonBlocking), "d3 dma stream");
-            for (cudaEvent_t& e : gp.dn_ev) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "d3 dma event");
+            gpu_dn_stream(gp);
             std::fprintf(stderr, "ds41_moe: STRATA_D3_DMA_STREAM on: %d staging slots, 2 banks x %d\n", gp.n_stage, gp.d3_bank);
         }
     }
     ck(cudaMalloc(&gp.d_stage, (size_t) gp.n_stage * (size_t) im_->blob), "d_stage");
     for (int i = 0; i < 4; ++i) ck(cudaEventCreate(&gp.ev[i]), "event");
+    for (int i = 4; i < 6; ++i) ck(cudaEventCreate(&gp.ev[i]), "event decprof");   // DS41_DEC_PROF: expert / sum spans
     ck(cudaMallocHost((void**) &gp.h_x, (size_t) kMaxTok * H4), "h_x");
     ck(cudaMallocHost(&gp.h_parts, (size_t) kMaxEnt * H4), "h_parts");
     ck(cudaMalloc(&gp.d_meta, kMetaBytes), "d_meta");
@@ -2936,6 +2955,18 @@ double g_prof[9] = {};
 int64_t g_prof_n = 0;
 const char* const g_prof_name[9] = {"split", "activation", "gpu launch", "cpu pool", "layer sync", "d2h parts",
                                     "sum", "admission", "pcie budget"};
+// DS41_DEC_PROF=1 (diagnostic, inert when unset): the expert tier's part of the decode table.  `kernels` counts the
+// launches this layer's gpu_run issues - the per-format-class grouped expert kernel of each site (one launch per
+// class among the entries, NOT one per expert), the activation quantize and the per-token weighted-sum kernel - and
+// the two device spans come from events recorded around them and read only after this call's own sum sync, i.e. when
+// the pair is complete (a pending pair returns cudaErrorNotReady and is counted as missed, never as 0 ms).
+static const bool g_decprof_on = [] {
+    const char * e = std::getenv("DS41_DEC_PROF");
+    return e && e[0] && e[0] != '0';
+}();
+struct TierDec { long long calls = 0, kernels = 0, sum_kernels = 0, classes = 0, ev_missed = 0;
+                 double dev_ms = 0, sum_ms = 0; };
+static TierDec g_tdec;
 /// arena_adapt: expert `e`'s bytes now sit in `victim`'s arena slot - hand the slot over (returns the slot).
 /// arena_check_swap, DS41_CHECK_ARENA=1: the swapped-in expert's arena bytes AND the next slot's owner (what an overrun
 /// would corrupt) against the file, byte for byte.  Shared by gpu_run (pool path) and gpu_run_n_ex (D3 FILEG path).
@@ -3001,9 +3032,10 @@ int32_t arena_victim(Ds41MoeImpl& im, int64_t layer, uint64_t need, const int32_
 
 bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x_host,
              const void* x_dev, float* out, void* out_dev = nullptr) {
-    static const bool prof = std::getenv("DS4_TIER_PROF") != nullptr;
+    static const bool prof = std::getenv("DS4_TIER_PROF") != nullptr || g_decprof_on;
     double tp = prof ? now_ms() : 0;
     auto mark = [&](int i) { if (prof) { const double t = now_ms(); g_prof[i] += t - tp; tp = t; } };
+    if (g_decprof_on) ++g_tdec.calls;
     Gpu& gp = *im.gpu;
     const int64_t H = im.g.n_embd;
     const int64_t K = im.g.top_k;
@@ -3124,6 +3156,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         strata::kernels::native_quantize_q8_1((const float*) gp.d_x, gp.d_xq, (int) H, 1, gp.s);
     }
     ck(cudaEventRecord(gp.ev[0], gp.s), "record activation");
+    if (g_decprof_on) ++g_tdec.kernels;   // one activation quantize kernel (its event above opens the expert device span)
     mark(1);
 
     // STRATA_TIER_GRAPH: capture the three sites' class launches once, on the first layer that gets here - gp.gll
@@ -3206,6 +3239,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             done += g.n;
             gs.push_back(std::move(g));
         }
+        if (g_decprof_on) { g_tdec.kernels += (long long) gs.size(); g_tdec.classes += (long long) gs.size(); }
         if (grp_graph) {
             // Slice B: this site's block is FIXED - one slot per class (kMetaClsMax), each laid out for kMaxParts
             // entries, which is exactly what the capture used, so a class's slot is a stable address for the graph.
@@ -3654,9 +3688,24 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         std::memcpy(gp.h_meta + o_w, wloc, sizeof(float) * (size_t) K);
         ck(cudaMemcpyAsync((uint8_t*) gp.d_meta + o_w, gp.h_meta + o_w, sizeof(float) * (size_t) K, cudaMemcpyHostToDevice,
                            gp.s), "sum weights");
+        // DS41_DEC_PROF: [4] closes the expert launches' device span (it is queued after every one of them), [5] closes
+        // the sum kernel's.  Both are read below, after this call's own sync, so neither can be pending then.
+        if (g_decprof_on) {
+            ck(cudaEventRecord(gp.ev[4], gp.s), "record expert span end");
+            ++g_tdec.kernels;
+            ++g_tdec.sum_kernels;
+        }
         strata::kernels::decode_rows_sum((const float*) gp.d_parts, (const float*) ((uint8_t*) gp.d_meta + o_w), (int) K, H,
                                          (float*) out_dev, gp.s);
+        if (g_decprof_on) ck(cudaEventRecord(gp.ev[5], gp.s), "record sum end");
         ck(cudaStreamSynchronize(gp.s), "sum sync");
+        if (g_decprof_on) {   // the pair is complete: a read here cannot be cudaErrorNotReady
+            float ms = 0;
+            if (cudaEventElapsedTime(&ms, gp.ev[0], gp.ev[4]) == cudaSuccess) g_tdec.dev_ms += ms;
+            else { ++g_tdec.ev_missed; cudaGetLastError(); }
+            if (cudaEventElapsedTime(&ms, gp.ev[4], gp.ev[5]) == cudaSuccess) g_tdec.sum_ms += ms;
+            else { ++g_tdec.ev_missed; cudaGetLastError(); }
+        }
     } else {
     ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) std::max<int64_t>(kMaxParts, K) * (size_t) H * 4,
                        cudaMemcpyDeviceToHost, gp.s), "d2h parts");
@@ -4139,7 +4188,12 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     // STRATA_D3_DMA_STREAM: the cross-call barrier.  Older work still queued on `s` (a gpu_run decode that skipped its
     // layer sync, its FILEG staging, ...) may read d_stage or the victim / arena slots this call's copies write: the
     // copy stream waits for all of it ONCE here, so this call's copies overlap only this call's own work below.
-    const bool dn = gp.s_dn != nullptr;
+    // `dn` = the D3 banked discipline is ARMED, i.e. STRATA_D3_DMA_STREAM built its two banks of d_stage slots at init
+    // - NOT "a copy stream exists".  The stream is shared infrastructure (the chunk path's blob H2D uses it too, on by
+    // default), so deriving the discipline from it alone armed a bank lay-out that was never allocated: d3_bank is 0
+    // then, every PCIe blob would land in bank 0/slot 0 and the kernels would read each other's experts.  The events
+    // are now made with the stream (gpu_dn_stream), so the barrier below can never see a null dn_ev.
+    const bool dn = gp.s_dn != nullptr && gp.d3_bank > 0;
     const cudaStream_t cs = dn ? gp.s_dn : gp.s;   // the PCIe site's copies
     if (dn) {
         ck(cudaEventRecord(gp.dn_ev[0], gp.s), "d3 dn barrier record");
@@ -5083,11 +5137,14 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         // STRATA_CHUNK_COPY_STREAM: the blobs' H2D gets a stream of its own (gp.s_dn, the one the D3 path's
         // STRATA_D3_DMA_STREAM uses) so it never queues behind the prestage's copies on s_cp, and a bank (default 4
         // blobs) is small enough that a pass holds several: the compute stream waits for bank k's copies only.
+        // The stream is taken from gpu_dn_stream - the ONE place the stream and its D3 events are created - so the
+        // chunk path can never leave gpu_run_n_ex recording on a null dn_ev (this is the abort that used to need
+        // STRATA_CHUNK_COPY_STREAM=0 or STRATA_D3_DMA_STREAM=1 to dodge).
         {
             const char* bs = std::getenv("STRATA_CHUNK_COPY_BANK");
             const bool on = !(std::getenv("STRATA_CHUNK_COPY_STREAM") && std::getenv("STRATA_CHUNK_COPY_STREAM")[0] == '0');
             gp.c_bank = on ? std::max<int64_t>(1, bs && *bs ? std::atoll(bs) : 4) : 0;
-            if (on && !gp.s_dn) ck(cudaStreamCreateWithFlags(&gp.s_dn, cudaStreamNonBlocking), "chunk blob stream");
+            if (on) gpu_dn_stream(gp);
             gp.s_blob = on ? gp.s_dn : nullptr;
             std::fprintf(stderr, "chunk copies: %s, %lld blobs a bank\n",
                          on ? "own stream (s_dn), banked" : "s_cp, one bank per half", (long long) (on ? gp.c_bank : 0));
@@ -7358,6 +7415,38 @@ std::vector<std::pair<int32_t, int32_t>> ds41_read_ranked(const std::string& pat
     in.read((char*) v.data(), (std::streamsize) (v.size() * 4));
     for (size_t i = 0; i + 1 < v.size(); i += 2) r.push_back({v[i], v[i + 1]});
     return r;
+}
+
+
+// ================================================================== DS41_DEC_PROF's expert-tier table
+// Per layer call and per token (n_layers calls = one token): the launches the tier issues - one grouped expert kernel
+// per format class among the entries (not one per expert; the 6 routing entries of a layer are grouped by class and
+// each class is ONE launch over all its entries), the activation quantize and the per-token weighted sum.  The device
+// spans are the two event pairs from gpu_run, read after that call's own sum sync, so a missed read is visible as
+// `ev_missed` and never enters a span as 0 ms.
+void ds41_moe_decprof_report(const char * tag, int n_layers) {
+    if (!g_decprof_on || g_tdec.calls == 0) return;
+    const double L = n_layers > 0 ? (double) n_layers : 40.0;
+    const double tok = (double) g_tdec.calls / L;
+    std::fprintf(stderr,
+                 "\nDS41_DEC_PROF expert tier (%s): %lld layer calls = %.2f tokens; %.2f launches/layer = %.1f/token "
+                 "(%.2f expert-class + 1 activation + 1 sum)\n",
+                 tag, (long long) g_tdec.calls, tok, (double) g_tdec.kernels / (double) g_tdec.calls,
+                 L * (double) g_tdec.kernels / (double) g_tdec.calls, (double) g_tdec.classes / (double) g_tdec.calls);
+    std::fprintf(stderr, "  device: expert launches %.3f ms/layer = %.2f ms/token | sum kernel %.3f ms/layer = %.2f ms/token\n",
+                 g_tdec.dev_ms / (double) g_tdec.calls, g_tdec.dev_ms / tok,
+                 g_tdec.sum_ms / (double) g_tdec.calls, g_tdec.sum_ms / tok);
+    if (g_prof_n > 0) {   // gpu_run's host wall split (the DS4_TIER_PROF buckets, on with DS41_DEC_PROF too)
+        double tot = 0;
+        for (int i = 0; i < 9; ++i) tot += g_prof[i];
+        std::fprintf(stderr, "  host wall: %.3f ms/layer = %.2f ms/token (all %lld calls) =",
+                     tot / (double) g_prof_n, L * tot / (double) g_prof_n, (long long) g_prof_n);
+        for (int i = 0; i < 9; ++i)
+            if (g_prof[i] > 0) std::fprintf(stderr, " %s %.3f", g_prof_name[i], g_prof[i] / (double) g_prof_n);
+        std::fprintf(stderr, " ms/layer\n");
+    }
+    std::fprintf(stderr, "  event pairs: %lld missed\n", (long long) g_tdec.ev_missed);
+    g_tdec = TierDec();
 }
 
 }  // namespace strata::v41

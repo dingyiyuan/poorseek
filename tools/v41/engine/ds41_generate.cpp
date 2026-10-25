@@ -65,6 +65,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -72,6 +73,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <dirent.h>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -393,6 +395,29 @@ double log_softmax_at(const float * lg, int nv, int tok) {
     double z = 0;
     for (int i = 0; i < nv; ++i) z += std::exp((double) lg[i] - mx);
     return (double) lg[tok] - mx - std::log(z);
+}
+
+/// The DSpark draft stack that ships beside a model: the first *.gguf in the model file's own directory whose name
+/// contains "MTP" (case-insensitive; this checkpoint's sidecar is V41-MTP-Vision-1017.Q2_K.gguf).  Empty = the model
+/// has none, and a one-shot decode then runs without drafts.  This is where the one-shot decode's DEFAULT sidecar
+/// comes from: STRATA_DSPARK=<path> overrides it, STRATA_DSPARK=0 turns DSpark off entirely.  The name is sorted so a
+/// directory that ever holds several still resolves to the same one on every run.
+std::string find_mtp_sidecar(const std::string & model) {
+    const size_t sl = model.find_last_of('/');
+    const std::string dir = sl == std::string::npos ? "." : (sl == 0 ? "/" : model.substr(0, sl));
+    DIR * d = opendir(dir.c_str());
+    if (!d) return {};
+    std::string best;
+    while (struct dirent * de = readdir(d)) {
+        const std::string n = de->d_name;
+        if (n.size() < 6 || n.compare(n.size() - 5, 5, ".gguf") != 0) continue;
+        std::string up = n;
+        for (char & c : up) c = (char) std::toupper((unsigned char) c);
+        if (up.find("MTP") == std::string::npos) continue;
+        if (best.empty() || n < best) best = n;
+    }
+    closedir(d);
+    return best.empty() ? std::string() : dir + "/" + best;
 }
 
 }  // namespace
@@ -788,7 +813,12 @@ int main(int argc, char ** argv) {
                  (now_ms() - t_load) / 1000.0, n_layer, (long long) ctx, a.prefill_chunk, tier.mode(), TG.cls_gu.size());
     // TASK 2: the first attention span's one-shot kernel costs (1,825 ms measured: two 850 ms K casts and a 94 ms
     // gather, all ~1.6 ms once warm) are paid HERE, on scratch tensors, so they do not land on the first prompt.
-    for (int st = 0; st < pipe.n_stages(); ++st) pipe.dense(st).warm_attn();
+    // DS41_NO_ATTN_WARM=1 skips it (bisect: the first FLASH_ATTN_EXT's OUT_OF_RESOURCES).
+    if (!std::getenv("DS41_NO_ATTN_WARM")) {
+        for (int st = 0; st < pipe.n_stages(); ++st) pipe.dense(st).warm_attn();
+    } else {
+        std::fprintf(stderr, "attn warm: SKIPPED (DS41_NO_ATTN_WARM)\n");
+    }
 
     // ---- the forward pieces
     std::vector<int> ids1((size_t) top_k);
@@ -801,8 +831,12 @@ int main(int argc, char ** argv) {
         if (!ds41_head_logits(pipe, row0, nrows, out, err)) { ferr = err; return false; }
         return true;
     };
-    // STRATA_DEC_PROF=1: per-stage wall time of the decode step (begin / predict+prefetch / attn_router / tier / finish)
-    static const bool dprof = std::getenv("STRATA_DEC_PROF") != nullptr;
+    // STRATA_DEC_PROF=1 / DS41_DEC_PROF=1: per-stage wall time of the decode step (begin / predict+prefetch /
+    // attn_router / tier / finish) plus head_logits and sample, reconciled against the measured decode wall; DS41_DEC_PROF
+    // additionally prints the dense graphs' device/host split (ds41_decprof_dense_report) and the expert tier's
+    // launch counts and device spans (ds41_moe_decprof_report) after the loop.
+    static const bool dec_gpu_prof = std::getenv("DS41_DEC_PROF") != nullptr;
+    static const bool dprof = std::getenv("STRATA_DEC_PROF") != nullptr || dec_gpu_prof;
     // decode: finish(l) and predict(l+1) as one graph (identical results; STRATA_NO_FUSE_PREDICT=1 = separate graphs)
     static const bool fuse_predict = std::getenv("STRATA_NO_FUSE_PREDICT") == nullptr;
     // STRATA_ADVISE_AHEAD=k (0 = off): at layer l, predict layer l+k's routing from the current state and hint its
@@ -839,7 +873,8 @@ int main(int argc, char ** argv) {
     // the host sum; no parts readback / routed upload per layer).  STRATA_DEC_HOSTSUM=1 = the host round trip
     // the routed tensor's device address: re-read after every dense.set_columns (elastic columns reallocate it)
     float * rdev1 = (!mc.cpu_only && !std::getenv("STRATA_DEC_HOSTSUM")) ? pipe.dense(0).routed_dev() : nullptr;
-    double dp[6] = {0, 0, 0, 0, 0, 0};
+    double dp[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // [0] begin, [1] predict/prefetch, [2] attn_router, [3] tier, [4] finish,
+                                               // [5] spec, [6] head_logits, [7] sample (the last two: outside step())
     long dp_n = 0;
     auto step = [&](int tok, int pos) -> bool {   // one token through every layer; logits via dense.logits
         double ta = dprof ? now_ms() : 0;
@@ -1154,10 +1189,75 @@ int main(int argc, char ** argv) {
     // decode biases (route bias + file penalty) switch on.  Returns the free GiB measured (for the log).
     double seed_free = 0, seed_gib = 0, seed_s = 0;
     // STRATA_DSPARK=<sidecar> (one-shot, greedy): DSpark speculative decoding - the checkpoint's mtp.0-2 draft stack
-    // (ds41_dspark) drafts STRATA_DSPARK_DEPTH (default 4, <= 5) tokens, one dense pass verifies them (pass_v).  The
+    // (ds41_dspark) drafts STRATA_DSPARK_DEPTH (default 1, <= 5) tokens, one dense pass verifies them (pass_v).  The
     // drafter loads here, before the VRAM expert cache measures the free memory, so the cache sizes around it.
     // --serve: STRATA_SERVE_DSPARK=<sidecar> (opt-in) - speculative SAMPLING (spec_accept), same output distribution
+    //
+    // THE ONE-SHOT DECODE DEFAULT IS DSpark AT DEPTH 1 (S17).  Measured at an 8K prompt, greedy, tokens identical:
+    // plain 11.13-11.49 tok/s (89.8 ms/token) vs depth 1 13.46 tok/s (132.4 ms verify + 9.26 ms draft / 1.939
+    // accepted = 73.1 ms/token); depth 4 was 8.41 tok/s (116.9 ms/token) because acceptance saturates (~0.88-0.94)
+    // while the verify pass grows 132 -> 210 ms, so DEEPER IS WORSE and the default stays at 1.
+    //   off  : STRATA_DSPARK=0 (also "off" / "none") - no drafter is loaded and decode runs the plain loop
+    //   path : STRATA_DSPARK=<file> picks another sidecar (any value that is not 0/off/none is a path)
+    //   depth: STRATA_DSPARK_DEPTH=1..5
+    // Unset = the default: the sidecar that ships beside the model (find_mtp_sidecar).  Auto-on is for the GREEDY
+    // one-shot decode only (--temp 0): the one-shot DSpark verifies by argmax, so a sampling run would silently lose
+    // its temperature - those keep the plain loop.  If the default cannot apply (no sidecar, no GPU layer-major
+    // prompt path, --dump-main, --force-ids) it falls back to plain decode; only an EXPLICIT STRATA_DSPARK=<path>
+    // that cannot apply is an error.
+    //
+    // THE AUTO DEFAULT IS ALSO GATED ON THE DECODE BUDGET (`-n` / n_predict, known before the prompt), with the
+    // threshold set by WHERE THE SEED COMES FROM, because that is the whole fixed cost:
+    //
+    //   (a) the seed has to be RE-RUN through pass_v (the old path; also the fallback below) - the last 128 prompt
+    //       tokens through 8 exact passes cost 27-38 s at an 8K prompt (measured +30.9 s: 30.67 -> 61.58 s) and
+    //       ~42 s at 64K (+42.2 s: 198.94 -> 241.15 s), while depth 1 pays back 13.8 ms/token at 8K and 44 ms/token
+    //       at 64K.  Break-even = 38000 / 13.8 = 2754 decoded tokens at the WORST 8K seed (27000 / 13.8 = 1957 at
+    //       the best), 42000 / 44 = 954 at 64K; 3000 clears the worst 8K line by 9% (3000 x 13.8 ms = 41.4 s > 38 s)
+    //       and the 64K line by 3.1x (3000 x 44 ms = 132 s > 42 s).  -> 3000.
+    //   (b) the seed is COPIED off the prompt batch's state columns (the read_state_cols capture below): 0.07-0.08 s
+    //       measured, i.e. free.  What is left is the drafter's load (0.7-0.8 s, 5.14 GB of weights) against the
+    //       decode gain - measured at 8K 87-93 -> 78-79 ms/token and at 64K 151-153 -> 114-120 ms/token - so
+    //       break-even = 800 / 8.3 = 96 decoded tokens at 8K (24 at 64K) and 128 is the same gate with a 33% margin.
+    //       -> 128 (a flat 3000 here would switch a measured pure win off for every normal turn).
+    // STRATA_DSPARK_MIN_PRED overrides the threshold for both (diagnostics); an EXPLICIT STRATA_DSPARK=<file> ignores
+    // the gate entirely.
+    const bool dsp_seed_copy = !a.serve && PB > 1 && defer_vram && S >= 17 && !dump_main && !std::getenv("STRATA_FORCE_IDS") &&
+                               !(std::getenv("STRATA_DSPARK_BATCH_SEED") && std::getenv("STRATA_DSPARK_BATCH_SEED")[0] == '0');
+    static const int dsp_min_pred_seed = 3000, dsp_min_pred_copy = 128;
+    const int dsp_auto_min_pred = std::getenv("STRATA_DSPARK_MIN_PRED")
+        ? std::atoi(std::getenv("STRATA_DSPARK_MIN_PRED")) : (dsp_seed_copy ? dsp_min_pred_copy : dsp_min_pred_seed);
     const char * dsp_path = a.serve ? std::getenv("STRATA_SERVE_DSPARK") : std::getenv("STRATA_DSPARK");
+    std::string dsp_auto;   // non-empty = the default picked this sidecar, so a refusal below is a fallback, not an error
+    bool dsp_off = false;
+    if (dsp_path) {
+        const std::string v = dsp_path;
+        if (v == "0" || v == "off" || v == "none") { dsp_off = true; dsp_path = nullptr; }
+    }
+    if (!a.serve && !dsp_path && !dsp_off && a.temp == 0) {
+        dsp_auto = find_mtp_sidecar(a.model);
+        if (!dsp_auto.empty() && a.n_predict < dsp_auto_min_pred) {
+            // the fixed cost cannot be amortised by this run's decode budget: keep the plain loop (a longer -n gets the
+            // default back; an explicit STRATA_DSPARK=<file> still forces it on)
+            if (dsp_seed_copy)
+                std::fprintf(stderr, "\nDSpark: decode default OFF for -n %d (< %d decoded tokens cannot pay back the 0.7-0.8 s "
+                                     "drafter load: break-even ~96 at an 8K prompt, ~24 at 64K): plain decode. "
+                                     "STRATA_DSPARK=<file> forces it on, STRATA_DSPARK=0 selects this quietly\n",
+                             a.n_predict, dsp_auto_min_pred);
+            else
+                std::fprintf(stderr, "\nDSpark: decode default OFF for -n %d (< %d decoded tokens cannot pay back the 27-42 s "
+                                     "pass_v prompt seed: break-even ~2754 at an 8K prompt, ~954 at 64K): plain decode. "
+                                     "STRATA_DSPARK=<file> forces it on, STRATA_DSPARK=0 selects this quietly\n",
+                             a.n_predict, dsp_auto_min_pred);
+            dsp_auto.clear();
+        } else if (!dsp_auto.empty()) {
+            dsp_path = dsp_auto.c_str();
+            std::fprintf(stderr, "\nDSpark: decode default (depth %s): sidecar %s beside the model; %d decoded tokens >= %d "
+                                 "pay back the %s; STRATA_DSPARK=0 turns it off\n",
+                         std::getenv("STRATA_DSPARK_DEPTH") ? std::getenv("STRATA_DSPARK_DEPTH") : "1", dsp_auto.c_str(),
+                         a.n_predict, dsp_auto_min_pred, dsp_seed_copy ? "0.7-0.8 s drafter load" : "27-42 s prompt seed");
+        }
+    }
     if (a.serve && dsp_path && (!defer_vram || S < 17)) {
         std::fprintf(stderr, "serve: STRATA_SERVE_DSPARK needs the GPU layer-major prompt path - DSpark off\n");
         dsp_path = nullptr;
@@ -1426,22 +1526,30 @@ int main(int argc, char ** argv) {
                         const int sn = std::min(SB, B - s);
                         if (!cur_dense->finish_span(l, s, sn)) { ferr = cur_dense->last_error(); return false; }
                     }
-                    // serve DSpark seed (bcap_n > 0): the main_hidden rows of the batch's last bcap_n tokens - pass_v's
-                    // HC-mean of the state leaving dm_layers[j] - read here, so the tail need not re-run as passes
-                    if (bcap_n > 0 && c0 + B == n) {
-                        for (int j = 0; j < 3; ++j) {
-                            if (l != dm_layers[j]) continue;
-                            const int cn = std::min(bcap_n, B);
-                            bcap_got = cn;
-                            if (!cur_dense->read_state_cols(B - cn, cn, vx)) { ferr = cur_dense->last_error(); return false; }
-                            const size_t HC = vx.size() / ((size_t) cn * n_embd);
-                            for (int t = 0; t < cn; ++t) {
-                                float * dst = bcap_vh.data() + (size_t) (bcap_n - cn + t) * 3 * n_embd + (size_t) j * n_embd;
-                                for (size_t h = 0; h < HC; ++h) {
-                                    const float * xs = vx.data() + ((size_t) t * HC + h) * n_embd;
-                                    for (int64_t d = 0; d < n_embd; ++d) dst[d] += xs[d] / (float) HC;
+                    // DSpark seed (bcap_n > 0): the main_hidden rows of the feed's last bcap_n columns - pass_v's
+                    // HC-mean of the state leaving dm_layers[j] (read_state_cols over the batch's OWN state columns:
+                    // the same x_state pass_v's read_state reads) - so the tail need not re-run as passes.  The tail may
+                    // STRADDLE two batches (a prompt just past a batch multiple leaves a narrow last batch), so each
+                    // batch captures the intersection of its columns with the window, placed by its offset from the
+                    // window's first column; bcap_got ends at the number of leading rows filled.
+                    if (bcap_n > 0) {
+                        const int tail0 = n - bcap_n;
+                        const int lo = std::max(c0, tail0), hi = c0 + B;
+                        if (hi > lo) {
+                            const int off = lo - tail0, cn = hi - lo;
+                            for (int j = 0; j < 3; ++j) {
+                                if (l != dm_layers[j]) continue;
+                                if (!cur_dense->read_state_cols(lo - c0, cn, vx)) { ferr = cur_dense->last_error(); return false; }
+                                const size_t HC = vx.size() / ((size_t) cn * n_embd);
+                                for (int t = 0; t < cn; ++t) {
+                                    float * dst = bcap_vh.data() + (size_t) (off + t) * 3 * n_embd + (size_t) j * n_embd;
+                                    for (size_t h = 0; h < HC; ++h) {
+                                        const float * xs = vx.data() + ((size_t) t * HC + h) * n_embd;
+                                        for (int64_t d = 0; d < n_embd; ++d) dst[d] += xs[d] / (float) HC;
+                                    }
                                 }
                             }
+                            bcap_got = std::max(bcap_got, off + cn);
                         }
                     }
                 }
@@ -1648,7 +1756,9 @@ int main(int argc, char ** argv) {
         // it carries over when the next request continues this one (dsp_next = the position its ring expects next);
         // any other reuse resets it (lower acceptance for a while, never a different output).
         int dsp_next = -1;
-        const int sp_depth_serve = std::getenv("STRATA_DSPARK_DEPTH") ? std::max(1, std::min(5, std::atoi(std::getenv("STRATA_DSPARK_DEPTH")))) : 4;
+        // depth 1, as the one-shot decode default: acceptance saturates near 0.9 while the verify pass grows with the
+        // depth (depth 4 measured 8.41 tok/s against depth 1's 13.46).  STRATA_DSPARK_DEPTH overrides it.
+        const int sp_depth_serve = std::getenv("STRATA_DSPARK_DEPTH") ? std::max(1, std::min(5, std::atoi(std::getenv("STRATA_DSPARK_DEPTH")))) : 1;
         long sv_pass = 0, sv_acc = 0;
 #endif
         // STRATA_SERVE_STEP_MAX: new prompt tokens up to which a request runs on the decode side - passes of
@@ -3189,19 +3299,47 @@ int main(int argc, char ** argv) {
 #if !defined(DS41_HAVE_DSPARK)
     if (spec) { std::fprintf(stderr, "ds41_generate: STRATA_DSPARK: built without ds41_dspark\n"); return 2; }
 #endif
-    const int spec_depth = std::getenv("STRATA_DSPARK_DEPTH") ? std::atoi(std::getenv("STRATA_DSPARK_DEPTH")) : 4;
+    // DEPTH 1 is the default (see the DSpark block above): acceptance saturates near 0.9 while the verify pass grows
+    // with the depth, so depth 4 measured 8.41 tok/s against depth 1's 13.46.  STRATA_DSPARK_DEPTH overrides it.
+    const int spec_depth = std::getenv("STRATA_DSPARK_DEPTH") ? std::atoi(std::getenv("STRATA_DSPARK_DEPTH")) : 1;
     if (spec && (!defer_vram || S < 17 || dump_main || spec_depth < 0 || spec_depth > 5 || std::getenv("STRATA_FORCE_IDS"))) {
-        std::fprintf(stderr, "ds41_generate: STRATA_DSPARK needs the GPU layer-major prompt path (S >= 17), depth 1..5, and no "
-                             "STRATA_DUMP_MAIN / STRATA_FORCE_IDS\n");
-        return 2;
+        if (dsp_auto.empty()) {
+            std::fprintf(stderr, "ds41_generate: STRATA_DSPARK needs the GPU layer-major prompt path (S >= 17), depth 1..5, and no "
+                                 "STRATA_DUMP_MAIN / STRATA_FORCE_IDS\n");
+            return 2;
+        }
+        // the decode DEFAULT does not apply here: fall back to the plain loop instead of failing a run that never
+        // asked for DSpark (STRATA_DSPARK=0 or an explicit path still behave as documented above)
+        std::fprintf(stderr, "DSpark: decode default not applicable (GPU layer-major prompt path %s, depth %d, dump-main %d, "
+                             "forced ids %d) - decoding without drafts\n",
+                     defer_vram && S >= 17 ? "yes" : "no", spec_depth, dump_main ? 1 : 0, std::getenv("STRATA_FORCE_IDS") ? 1 : 0);
+        dsp_path = nullptr;
+        spec = false;
     }
     if (spec && a.temp > 0) std::fprintf(stderr, "note: STRATA_DSPARK decodes greedily (temp ignored)\n");
-    // the DSpark window needs per-position main_hidden, which the layer-major prompt does not produce: the last
-    // min(128, L-1) prompt tokens run through pass_v (chunks of <= 16) after the VRAM cache opens
+    // The DSpark window needs per-position main_hidden for the last min(128, L-1) prompt tokens.  The layer-major
+    // sweep DOES hold it, for every column of the batch it is running (x_state, which pass_v's taps read), so the
+    // prompt batch CAPTURES the last sp_tail rows (read_state_cols at layers 36/37/38) and the seed becomes a host
+    // copy instead of 8 exact passes: the 27-42 s prompt tax is gone (measured before this: +30.9 s at 8K, +42.2 s at
+    // 64K).  Cost: a host buffer of sp_tail x 3 x n_embd floats (128 x 3 x 5120 x 4 = 7.9 MB) + the three read-backs,
+    // which reuse the batch's already-computed state columns - no device buffer, no extra graph.  What the seed needs
+    // is exactly these 3 x main_hidden rows per position (ds41_dspark.hpp: main_hidden = HC-mean of the residual
+    // entering layers 37/38/39; the block windows are then kv_norm(wkv(main_x)) RoPE'd by position), so nothing else
+    // has to be kept.  The rows feed the DRAFTER only: the trunk's prompt state and last-row logits are untouched, so
+    // the prompt side is bit-identical to plain decode (--dump-last included), and drafts are verified, so the decoded
+    // ids match the plain arm's (8K 64/64 and 128/128, 64K 16/16, 8300-token straddle 16/16 measured).
+    // STRATA_DSPARK_BATCH_SEED=0 = the old pass_v tail (diagnostics); a batch path that captures nothing falls back to
+    // the same pass_v tail.
+    const bool dsp_batch_seed = !(std::getenv("STRATA_DSPARK_BATCH_SEED") && std::getenv("STRATA_DSPARK_BATCH_SEED")[0] == '0');
     const int sp_tail = spec ? std::min<int>(128, (int) prompt.size() - 1) : 0;
-    const bool ok = feed(prompt.data(), (int) prompt.size() - dm_tail - sp_tail, 0, [&](int done) {
+    const int sp_total = (int) prompt.size() - dm_tail;   // the columns this feed must cover
+    const int sp_cap = (spec && dsp_batch_seed && PB > 1 && sp_total >= 2) ? sp_tail : 0;   // rows to capture
+    bcap_n = sp_cap; bcap_got = 0;
+    if (sp_cap > 0) bcap_vh.assign((size_t) sp_cap * 3 * n_embd, 0.0f);
+    const bool ok = feed(prompt.data(), sp_cap > 0 ? sp_total : sp_total - sp_tail, 0, [&](int done) {
         if (!a.quiet) std::fprintf(stderr, "\rprompt %d/%zu", done, prompt.size());
     }, a.ppl || !a.dump_logits.empty() ? &all : nullptr);
+    bcap_n = 0;   // (the capture only runs for the feed's last bcap_n columns; nothing else reads it now)
     if (!ok) { std::fprintf(stderr, "\nds41_generate: prefill: %s\n", ferr.c_str()); return 1; }
     if (dm_tail > 0 && defer_vram && !open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
     for (int i = (int) prompt.size() - dm_tail; i < (int) prompt.size(); ++i)
@@ -3218,12 +3356,17 @@ int main(int argc, char ** argv) {
         bias_now = false;   // the tail is PROMPT: it routes like the rest of the prompt (no decode biases), as plain decode
         apply_bias();
         std::vector<int> spos;
-        for (int i0 = (int) prompt.size() - sp_tail; i0 < (int) prompt.size(); i0 += 16) {
-            const int m = std::min<int>(16, (int) prompt.size() - i0);
+        const double seed_t0 = now_ms();
+        // the rows the prompt batch already holds (its last sp_cap columns, global positions sp_total - sp_cap .. sp_total)
+        const int sp_have = std::min(sp_cap, std::max(0, bcap_got));
+        const int sp_first = sp_total - sp_tail;   // the window's first position
+        const int sp_psplit = sp_total - sp_have;  // [sp_first, sp_psplit): the rows still needing pass_v
+        for (int i0 = sp_first; i0 < sp_psplit; i0 += 16) {   // (only when the batch captured less than the window)
+            const int m = std::min<int>(16, sp_psplit - i0);
             if (!pass_v(prompt.data() + i0, m, i0)) { std::fprintf(stderr, "ds41_generate: DSpark seed: %s\n", ferr.c_str()); return 1; }
             spos.resize((size_t) m);
             for (int t = 0; t < m; ++t) spos[(size_t) t] = i0 + t;
-            const bool last = i0 + m == (int) prompt.size();
+            const bool last = i0 + m == sp_total;   // (the whole window through pass_v: its last row IS the logits row)
             if (last) {
                 std::copy(vlog.end() - nv, vlog.end(), last_logits.begin());
                 sp_bonus = (int) (std::max_element(last_logits.begin(), last_logits.end()) - last_logits.begin());
@@ -3233,6 +3376,22 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
+        for (int i0 = sp_total - sp_have; sp_have > 0 && i0 < sp_total; i0 += 16) {   // the batch's rows: append + draft
+            const int m = std::min<int>(16, sp_total - i0);
+            spos.resize((size_t) m);
+            for (int t = 0; t < m; ++t) spos[(size_t) t] = i0 + t;
+            const bool last = i0 + m == sp_total;
+            if (last) sp_bonus = (int) (std::max_element(last_logits.begin(), last_logits.end()) - last_logits.begin());
+            const float * rows = bcap_vh.data() + (size_t) (i0 - (sp_total - sp_cap)) * 3 * n_embd;
+            if (!dsp->step(rows, spos.data(), m, last ? sp_bonus : -1, last ? sp_ids : sp_tmp, sp_conf)) {
+                std::fprintf(stderr, "ds41_generate: DSpark seed step: %s\n", dsp->last_error().c_str());
+                return 1;
+            }
+        }
+        if (sp_cap > 0 && sp_have < sp_tail)
+            std::fprintf(stderr, "DSpark: the prompt batch captured %d of %d seed rows - the rest through pass_v\n", sp_have, sp_tail);
+        std::fprintf(stderr, "DSpark: seed %d rows in %.2f s (%s)\n", sp_tail, (now_ms() - seed_t0) / 1000.0,
+                     sp_have >= sp_tail ? "all copied from the prompt batch's state" : "pass_v tail");
         bias_now = true;    // decode: route bias + file penalty on (open_cache's state)
         apply_bias();
     }
@@ -3405,7 +3564,9 @@ int main(int argc, char ** argv) {
     }
 #endif
     for (; !spec && gen < a.n_predict; ++gen) {
+        const double tsp = dprof ? now_ms() : 0;
         int tok = sample_p(lg.data(), nv, a.temp, 0, 1.0f, 0.0f, rng);
+        if (dprof) dp[7] += now_ms() - tsp;
         if (gen < (int) forced.size()) {
             // STRATA_DEC_MARGIN=1 (gate tap, with STRATA_FORCE_IDS): per step the argmax, its logit and the forced
             // token's logit - a forced stream that leaves the greedy path at a near-tie shows a tiny gap there
@@ -3419,11 +3580,41 @@ int main(int argc, char ** argv) {
         std::fflush(stdout);
         if (std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end() || tok == (int) G.eos) { ++gen; break; }
         if (gen + 1 == a.n_predict) { ++gen; break; }
-        if (!step(tok, pos) || !head_logits(0, 1, lg.data())) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
+        if (!step(tok, pos)) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
+        const double th = dprof ? now_ms() : 0;
+        if (!head_logits(0, 1, lg.data())) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
+        if (dprof) dp[6] += now_ms() - th;
         ++pos;
     }
     const double dec_ms = now_ms() - td0;
     if (prof_decode) Ds41MoeTier::profiler(false);
+    // DS41_DEC_PROF / STRATA_DEC_PROF: the per-token table, reconciled against the wall the tok/s line divides.
+    // `step()` charges begin/attn_router/tier/finish inside the per-token lambda; head_logits and sample run in the
+    // loop and are charged here, so the buckets and the measured wall have the same denominator (steps = gen - 1).
+    if (dprof) {
+        const double tok = (double) std::max<long>(1, dp_n);
+        const double measured = dec_ms / (double) std::max(1, gen - 1);
+        double sum = 0;
+        for (int i = 0; i < 8; ++i) sum += dp[i] / tok;
+        std::fprintf(stderr, "\ndecode breakdown (%ld steps = %.0f ms/token measured):\n", dp_n, measured);
+        std::fprintf(stderr, "  %-34s %9s %8s\n", "bucket", "ms/token", "share");
+        for (int i = 0; i < 8; ++i)
+            std::fprintf(stderr, "  %-34s %9.2f %7.1f %%\n",
+                         i == 0 ? "begin (embedding init graph)" : i == 1 ? "predict/prefetch" : i == 2 ? "attn_router (attn core + proj + router + shexp)" :
+                         i == 3 ? "tier (routed experts)" : i == 4 ? "finish (routed add + hc_post)" : i == 5 ? "spec (DSpark verify/draft)" :
+                         i == 6 ? "head_logits (LM head + readback)" : "sample",
+                         dp[i] / tok, measured > 0 ? 100.0 * dp[i] / tok / measured : 0.0);
+        std::fprintf(stderr, "  %-34s %9.2f\n", "sum of buckets", sum);
+        std::fprintf(stderr, "  %-34s %9.2f\n", "measured wall/token", measured);
+        std::fprintf(stderr, "  %-34s %9.2f  (host loop, printf/fflush, per-step bookkeeping)\n", "residue", measured - sum);
+    }
+    if (dec_gpu_prof) {   // the device/host split of the dense graphs and the tier's launches and device spans
+        ds41_decprof_dense_report("decode");
+        ds41_moe_decprof_report("decode", (int) n_layer);
+    }
+    // DS41_ATTN_PROF / DS41_PART_PROF: close the decode segment here so the node probe's per-bucket and per-part tables
+    // are printed for DECODE, not only for the prompt (the probe is inert unless its variable is set).
+    dense.dprof_checkpoint("decode");
     const Ds41MoeStats st = tier.stats();
     std::fprintf(stderr, "decode: %d tokens in %.2f s = %.2f tok/s; experts %lld hit / %lld cpu / %lld pcie / %lld file "
                  "(%.1f%% VRAM hits), cpu %.0f ms, file %.0f ms; spec reads %lld issued / %lld used; prefetch %lld issued / "

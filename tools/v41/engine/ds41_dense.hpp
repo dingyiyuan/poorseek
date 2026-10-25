@@ -29,6 +29,14 @@
 #include <string>
 #include <vector>
 
+/// DS41_DEC_PROF=1 (diagnostic, inert when unset): print the decode step's dense-side table - one row per graph kind
+/// (init / attn_router / finish / finish_predict / predict / head) with calls, node count (= kernel launches), wall
+/// time, DEVICE time from an event pair recorded around the single graph submission and held until that submission's
+/// own sync has completed (a pending pair would return cudaErrorNotReady; those are counted and reported, never as 0
+/// ms), and the host submit+sync residue.  Also begin()'s upload+Engram wall.  Called by ds41_generate after the
+/// decode loop; prints nothing and reads no clock when the variable is unset.
+void ds41_decprof_dense_report(const char * tag);
+
 struct Ds41DenseConfig {
     ggml_backend_t backend = nullptr;   ///< NULL = create and own a CPU backend
     int     n_threads = 8;

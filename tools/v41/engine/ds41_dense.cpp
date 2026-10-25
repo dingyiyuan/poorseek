@@ -337,6 +337,125 @@ AtExit::~AtExit() { final_report(); }
 
 }  // namespace dprof
 
+// ================================================================== DS41_DEC_PROF: the decode step's dense side
+// DS41_DEC_PROF=1 (diagnostic; inert when unset - one branch on a constant per graph submission and no clock read).
+// The decode path submits ONE ggml graph per dense API call (82-83 a token: 1 init + 40 attn_router + 40 finish or
+// finish_predict + 1 head) and every one of them is submit+Synchronize, so the two things that decide a decode token's
+// dense wall are (a) how many kernels the graph holds - one ggml node is one kernel launch - and (b) how much of the
+// wall is device time against host submit/sync.  This measures both per graph kind:
+//
+//   * wall      = host clock around the submission (what strate DEC prof's stage buckets already see)
+//   * dev       = an event PAIR on the same in-order queue (the shim's null stream IS ggml's adopted queue, so the
+//                 pair brackets exactly this graph's kernels), read only AFTER the submission's own sync returned -
+//                 i.e. when both events have completed.  The old prompt-path bug was reading a pair that was still
+//                 pending: cudaEventElapsedTime returns cudaErrorNotReady then, and the caller left the accumulator
+//                 at 0, so a 50.86 us/entry kernel read as 3.09 us.  A pending or failed read here is counted as
+//                 `missed` and printed; it is never added as 0 ms.
+//   * nodes     = gf->n_nodes, the kernel-launch count (the attn node probe's own per-node table is the same count)
+//   * dev/launch = dev / nodes, the mean device time of one kernel of that kind
+namespace decprof {
+
+enum Kind { G_INIT = 0, G_ATTN, G_FINISH, G_FINPRED, G_PREDICT, G_HEAD, G_NK };
+static const char * const kName[G_NK] = { "init/embed", "attn_router+shexp", "finish", "finish_predict", "predict",
+                                          "head/logits" };
+enum { S_INIT = 0, S_ATTN, S_FIN, S_FINPRED, S_PRED, S_HEAD, S_SAMPLE, S_ENGRAM, S_NS };
+static const char * const kSName[S_NS] = { "begin(init graph)", "attn_router", "finish", "finish_predict", "predict",
+                                           "head_logits", "sample", "engram+upload" };
+
+struct Row { long long calls = 0, nodes = 0, missed = 0; double wall_ms = 0, dev_ms = 0; };
+
+static const bool g_on = [] {
+    const char * e = std::getenv("DS41_DEC_PROF");
+    return e && e[0] && e[0] != '0';
+}();
+static Row g_row[G_NK];
+static int g_kind = -1;                       // the kind the next compute() charges; -1 = not a decode graph
+static int g_layers = 0;                      // layer count (from attn_router): tokens = attn calls / this
+static cudaEvent_t g_e0 = nullptr, g_e1 = nullptr;
+static long long g_pairs = 0;
+static double g_upload_ms = 0;
+static long long g_uploads = 0;
+
+static inline double now_ms() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/// Marks the next compute() as graph kind `k` and restores "not a decode graph" on scope exit (a failure before the
+/// submission must not leave the kind set for the next graph).
+struct KindGuard {
+    explicit KindGuard(int k) { if (g_on) g_kind = k; }
+    ~KindGuard() { if (g_on) g_kind = -1; }
+};
+
+/// Just before the submission: enqueue the opening barrier (both events are created once).
+static void open_pair() {
+    if (!g_on || g_kind < 0) return;
+    if (!g_e0) {
+        if (cudaEventCreate(&g_e0) != cudaSuccess || cudaEventCreate(&g_e1) != cudaSuccess) {
+            cudaGetLastError();
+            g_e0 = g_e1 = nullptr;
+            return;
+        }
+    }
+    if (cudaEventRecord(g_e0, nullptr) != cudaSuccess) { cudaGetLastError(); g_e0 = nullptr; }
+}
+
+/// Right after ggml_backend_graph_compute returned (it synchronizes), so the closing barrier has completed.
+static void histogram(ggml_cgraph * gf, int kind);   // DS41_NODE_HIST (defined below, used per submission)
+
+static void close_pair(ggml_cgraph * gf, double wall0) {
+    const long long nodes = gf ? gf->n_nodes : 0;
+    if (!g_on) return;
+    const int k = g_kind;
+    if (k < 0 || k >= G_NK) return;
+    histogram(gf, k);
+    Row & r = g_row[k];
+    ++r.calls;
+    r.nodes += nodes;
+    r.wall_ms += now_ms() - wall0;
+    if (!g_e0) { ++r.missed; return; }
+    cudaEventRecord(g_e1, nullptr);
+    cudaEventSynchronize(g_e1);              // the submission's sync already did this: the pair is complete
+    float ms = 0;
+    if (cudaEventElapsedTime(&ms, g_e0, g_e1) == cudaSuccess) { r.dev_ms += ms; ++g_pairs; }
+    else { ++r.missed; cudaGetLastError(); } // reported, not silently counted as 0
+}
+
+static void add_upload(double ms) { if (!g_on) return; g_upload_ms += ms; ++g_uploads; }
+
+// DS41_NODE_HIST=1 (with DS41_DEC_PROF): one histogram of the op kinds in the first graph of each kind.  This is the
+// exact composition behind "200.6 nodes/call" - one ggml node is one kernel launch - and it is what says which fusions
+// are worth anything (how many of the launches are elementwise/cast/copy glue against real GEMMs).
+static const bool g_hist = std::getenv("DS41_NODE_HIST") != nullptr;
+static int g_hist_done[G_NK] = {};
+static void histogram(ggml_cgraph * gf, int kind) {
+    if (!g_hist || gf == nullptr || kind < 0 || kind >= G_NK || g_hist_done[kind] >= 4) return;
+    ++g_hist_done[kind];
+    std::map<std::string, int> m;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        char b[96];
+        const ggml_tensor * t = gf->nodes[i];
+        std::snprintf(b, sizeof(b), "%s %s", ggml_op_name(t->op), ggml_type_name(t->type));
+        m[b] += 1;
+    }
+    std::vector<std::pair<std::string, int>> v(m.begin(), m.end());
+    std::sort(v.begin(), v.end(), [](const auto & a, const auto & c) { return a.second > c.second; });
+    int launch = 0;   // nodes that become a kernel launch: the backend skips views/reshapes/permutes (ggml_sycl_is_view_or_noop)
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const ggml_op op = gf->nodes[i]->op;
+        if (op == GGML_OP_RESHAPE || op == GGML_OP_TRANSPOSE || op == GGML_OP_VIEW || op == GGML_OP_PERMUTE ||
+            op == GGML_OP_NONE) continue;
+        ++launch;
+    }
+    std::fprintf(stderr, "\nDS41_NODE_HIST %s: %d nodes, %d launchable (backend fusion not counted):", kName[kind],
+                 gf->n_nodes, launch);
+    for (const auto & kv : v) std::fprintf(stderr, " [%s x%d]", kv.first.c_str(), kv.second);
+    std::fprintf(stderr, "\n");
+}
+
+
+}  // namespace decprof
+
 // The call-site wrappers.  Each keeps the original call's argument list verbatim (a pure callee rename), so the diff
 // of this file is the instrumentation and nothing else: cat, bytes and __LINE__ (the call site) are the only additions.
 #define DPROF_SET(...)       dprof::call(dprof::C_SET,       __LINE__, dprof::bytes_last(__VA_ARGS__), [&] { ggml_backend_tensor_set(__VA_ARGS__); })
@@ -1662,9 +1781,14 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached) {
     // DS41_DPROF: the dense path's ONLY graph submission.  In this fork ggml_backend_graph_compute = async +
     // synchronize (src/ggml-backend.cpp:595), so this interval is submit + every kernel + the final stream wait.
     const double d2 = dpo ? dprof::us_now() : 0;
+    // DS41_DEC_PROF: the device/launch pair.  The opening barrier goes on the in-order queue right before the
+    // submission; the closing one is read after the submission's sync, i.e. when both have completed (see decprof).
+    decprof::open_pair();
+    const double dw0 = decprof::g_on ? decprof::now_ms() : 0.0;
     // partprof::run is the path when either the part probe or the dense GEMM routing has something to do
     const ggml_status gst = (partprof::on || densegemm::active(gf)) ? partprof::run(backend, gf)
                                                                     : ggml_backend_graph_compute(backend, gf);
+    if (decprof::g_on) decprof::close_pair(gf, dw0);
     if (dpo) {
         const double d3 = dprof::us_now();
         dprof::leaf_add(dprof::C_ALLOC, __LINE__, d1 - d0, 0);
@@ -1690,14 +1814,30 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached) {
 // an F16 result too (getrows.cpp, k_get_rows_f16x8: 8 elements per work-item, the same float -> f16 rounding the cpy
 // used), so both backends take the one-step form; the tensor is retyped before the graph is allocated, so the F32
 // result of the same rows does not exist and neither does the cpy over it.
+// DS41_ROWS_F32=1: the pre-S16 form (gather F32 then cpy to F16), for bisecting the F16 get_rows result.
+static bool rows_as_f32_path() {
+    static const bool v = std::getenv("DS41_ROWS_F32") != nullptr;
+    return v;
+}
+
 static ggml_tensor * rows_as(ggml_context * gc, ggml_tensor * a, ggml_tensor * idx, bool f16) {
     ggml_tensor * t = ggml_get_rows(gc, a, idx);
     if (f16 && t->type == GGML_TYPE_F32) {
+        if (rows_as_f32_path()) return ggml_cast(gc, t, GGML_TYPE_F16);
         t->type = GGML_TYPE_F16;
         t->nb[0] = ggml_type_size(GGML_TYPE_F16);
         for (int i = 1; i < GGML_MAX_DIMS; ++i) t->nb[i] = t->nb[i - 1] * t->ne[i - 1];
     }
     return t;
+}
+
+// DS41_ATTN_K16=0: the pre-S16 attention structure (separate window / compressed gathers into F32-concat keys, pad).
+static bool attn_k16_enabled() {
+    static const bool v = [] {
+        const char * e = std::getenv("DS41_ATTN_K16");
+        return !(e && e[0] == '0');
+    }();
+    return v;
 }
 
 static ggml_tensor * fake_quant(ggml_context * gc, ggml_tensor * x, Ds41Quant mode) {
@@ -1990,13 +2130,17 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         // values are the old path's: an F16 image of the same source rounds each value exactly once, which is what the
         // old gather(f32) + cpy(f32->f16) did (bf16 -> float is exact, an f32 value rounds once), and the pad is fully
         // masked (see the assembly below).
-        const bool k16 = f16 && !merge_fa;
+        const bool k16 = f16 && !merge_fa && attn_k16_enabled();
         ggml_tensor * Mw = b.cols2(im.i_wmask, SWA, gk, gc0);
         ggml_tensor * ksrc = nullptr, * kiidx = nullptr;   // k16: the merged F16 source and its row indices
         ggml_tensor * Kw = nullptr;                        // the F32 path's window keys
         if (k16) {
             ksrc = ggml_concat(gc, ggml_cast(gc, SL.raw, GGML_TYPE_F16), ggml_cast(gc, gkv2, GGML_TYPE_F16), 1);   // [DH, RAW + k]
-            kiidx = ggml_view_2d(gc, im.i_widx, SWA, gk, im.i_widx->nb[1], (size_t) gc0 * SWA * 4);                // [SWA, k]
+            // The window rows' indices, [SWA, k], column t at t*SWA - the slab's own layout (span_attn_one fills
+            // i_widx as widx[t*SWA + j] and uploads it at gc0*SWA*4).  im.i_widx is 1-D, so its nb[1] is the WHOLE
+            // slab (SWA*NC*4); the view must take the packed row stride SWA*4, which is what the 1-D view the old
+            // path uses (b.v1 below) is.  reshaped 2-D only so the compressed/pad rows can be concatenated per column.
+            kiidx = ggml_reshape_2d(gc, b.v1(im.i_widx, SWA * gk, (size_t) gc0 * SWA * 4), SWA, gk);               // [SWA, k]
         } else {
             ggml_tensor * wsrc = ggml_concat(gc, SL.raw->type == GGML_TYPE_F32 ? SL.raw : ggml_cast(gc, SL.raw, GGML_TYPE_F32), gkv2, 1);     // [DH, RAW + k]
             Kw = ggml_reshape_3d(gc, rows_as(gc, wsrc, b.v1(im.i_widx, SWA * gk, (size_t) gc0 * SWA * 4), f16), DH, SWA, gk);
@@ -2192,6 +2336,21 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
             }
             k4 = Kall->type == GGML_TYPE_F16 ? ggml_reshape_4d(gc, Kall, DH, M, 1, gk)
                                              : ggml_cast(gc, ggml_reshape_4d(gc, Kall, DH, M, 1, gk), GGML_TYPE_F16);
+        }
+        if (std::getenv("DS41_FA_TRACE")) {   // bisect aid: the exact flash-attn inputs of the first few cores
+            static int n_tr = 0;
+            if (n_tr < 8) {
+                ++n_tr;
+                std::fprintf(stderr, "[FA-TRACE] #%d il=%d k16=%d gk=%lld M=%lld Ksel=%lld gcap=%lld SWA=%lld RAW=%lld "
+                        "Kne=%lld,%lld,%lld,%lld Knb=%zu,%zu,%zu,%zu Ktype=%s Knb=%.1fMB maskne=%lld,%lld,%lld,%lld "
+                        "ksrcrows=%lld\n",
+                        n_tr, il, (int) k16, (long long) gk, (long long) M, (long long) Ksel, (long long) gcap,
+                        (long long) SWA, (long long) RAW,
+                        (long long) k4->ne[0], (long long) k4->ne[1], (long long) k4->ne[2], (long long) k4->ne[3],
+                        k4->nb[0], k4->nb[1], k4->nb[2], k4->nb[3], ggml_type_name(k4->type), ggml_nbytes(k4) / 1048576.0,
+                        (long long) Mall->ne[0], (long long) Mall->ne[1], (long long) Mall->ne[2], (long long) Mall->ne[3],
+                        (long long) (ksrc ? ksrc->ne[1] : 0));
+            }
         }
         ggml_tensor * gq = whole ? q : ggml_cont(gc, ggml_view_3d(gc, q, DH, NH, gk, q->nb[1], q->nb[2], (size_t) rel * q->nb[2]));
         ggml_tensor * q4 = ggml_permute(gc, ggml_reshape_4d(gc, gq, DH, NH, 1, gk), 0, 2, 1, 3);    // [DH, 1, NH, k]
@@ -3326,11 +3485,14 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
     Impl & im = *p_;
     DPROF_SPAN(dprof::C_BEGIN);
     if (dprof::g_on) ++dprof::st().begins;
+    decprof::KindGuard dec_kind(decprof::G_INIT);   // DS41_DEC_PROF: charge this graph to init (inert when unset)
     if (n < 1 || n > im.NC || pos0 < 0 || pos0 + n > im.cfg.ctx_max) { im.err = "bad pass"; return false; }
     im.pos0 = pos0;
     im.n = n;
     im.rows_mode = false;
+    const double du0 = decprof::g_on ? decprof::now_ms() : 0.0;
     if (!im.upload_inputs(tids, n, pos0)) return false;
+    if (decprof::g_on) decprof::add_upload(decprof::now_ms() - du0);   // token/position uploads + the Engram row reads
     span_pass_caps(im, pos0, n, im.pass_cap);
     // embeddings -> state
     ggml_context * gc = nullptr;
@@ -3760,6 +3922,8 @@ const float * Ds41Dense::batch_fn() const { return p_->host_fn.data(); }
 bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_host, ggml_tensor ** fn_dev) {
     Impl & im = *p_;
     DPROF_SPAN(dprof::C_ATTN);
+    decprof::KindGuard dec_kind(decprof::G_ATTN);   // DS41_DEC_PROF: charge this graph to attn+router+shexp
+    if (decprof::g_on) decprof::g_layers = (int) im.ly.size();
     const int64_t n = im.n;
     // Engram layer: wait the pass's reads (started in upload_inputs) before the graph that reads i_eng runs.  For the
     // chunk path this is the first Engram layer too, so the layers below it ran while the disk was reading.
@@ -3812,6 +3976,7 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
 bool Ds41Dense::predict(int il, int * top_ids, int n_top) {
     Impl & im = *p_;
     DPROF_SPAN(dprof::C_PREDICT);
+    decprof::KindGuard dec_kind(decprof::G_PREDICT);   // DS41_DEC_PROF
     if (im.n != 1 || n_top < 1 || n_top > 16) return false;
     const Impl::GKey key { il, 3, 0, 1 };
     auto it = im.graphs.find(key);
@@ -3851,6 +4016,7 @@ bool Ds41Dense::predict_multi(int il, int * top_ids) {
 bool Ds41Dense::finish(int il, const float * routed_sum) {
     Impl & im = *p_;
     DPROF_SPAN(dprof::C_FINISH);
+    decprof::KindGuard dec_kind(decprof::G_FINISH);   // DS41_DEC_PROF
     (void) il;
     const int64_t n = im.n;
     if (routed_sum) DPROF_SET(im.routed, routed_sum, 0, (size_t) (im.D * n) * 4);
@@ -3883,6 +4049,7 @@ bool Ds41Dense::finish(int il, const float * routed_sum) {
 bool Ds41Dense::finish_predict(int il, const float * routed_sum, int next_il, int * top_ids, int n_top) {
     Impl & im = *p_;
     DPROF_SPAN(dprof::C_FINPRED);
+    decprof::KindGuard dec_kind(decprof::G_FINPRED);   // DS41_DEC_PROF
     (void) il;
     if (im.n != 1 || n_top < 1 || n_top > 16 || next_il < 0 || next_il >= (int) im.ly.size()) return false;
     if (routed_sum) DPROF_SET(im.routed, routed_sum, 0, (size_t) im.D * 4);
@@ -3906,6 +4073,7 @@ bool Ds41Dense::finish_predict_ahead(int il, const float * routed_sum, int next_
     Impl & im = *p_;
     (void) il;
     if (ahead <= 0 || !ahead_ids) return finish_predict(il, routed_sum, next_il, top_ids, n_top);
+    decprof::KindGuard dec_kind(decprof::G_FINPRED);   // DS41_DEC_PROF
     if (im.n != 1 || n_top < 1 || n_top > 16 || next_il < 0 || next_il >= (int) im.ly.size()) return false;
     if (routed_sum) DPROF_SET(im.routed, routed_sum, 0, (size_t) im.D * 4);
     const Impl::GKey key { next_il, 6, ahead, 1 };
@@ -3937,6 +4105,7 @@ bool Ds41Dense::finish_predict_ahead(int il, const float * routed_sum, int next_
 
 bool Ds41Dense::logits(int row0, int nrows, float * out) {
     DPROF_SPAN(dprof::C_HEAD);
+    decprof::KindGuard dec_kind(decprof::G_HEAD);   // DS41_DEC_PROF
     if (!owns_head()) { p_->err = "logits on a stage without the head"; return false; }
     Impl & im = *p_;
     if (row0 < 0 || nrows < 1 || row0 + nrows > im.n) { im.err = "bad logits rows"; return false; }
@@ -4488,4 +4657,55 @@ bool Ds41Dense::restore_conversation(const std::vector<uint8_t> & in) {
     im.snap_pos = (int) snap;
     DPROF_SYNC(im.backend);
     return true;
+}
+
+// ================================================================== DS41_DEC_PROF's dense table (see the header)
+// One row per decode graph kind: calls, nodes (= kernel launches), wall, device (event pair, read only when complete),
+// host submit+sync, and the mean device time of one launch.  Per-token figures divide by the attn_router calls over
+// the layer count (one per layer per token), so a run of N tokens reports N exactly - a missed pair is printed as a
+// count and the device column stays short by that much, visibly, instead of absorbing it as 0 ms.
+void ds41_decprof_dense_report(const char * tag) {
+    namespace D = decprof;
+    if (!D::g_on) return;
+    double tw = 0, td = 0;
+    long long tc = 0, tn = 0, missed = 0;
+    for (int k = 0; k < D::G_NK; ++k) {
+        tw += D::g_row[k].wall_ms;
+        td += D::g_row[k].dev_ms;
+        tc += D::g_row[k].calls;
+        tn += D::g_row[k].nodes;
+        missed += D::g_row[k].missed;
+    }
+    if (tc == 0) return;
+    const long long tokens = (D::g_layers > 0 && D::g_row[D::G_ATTN].calls > 0)
+                                 ? D::g_row[D::G_ATTN].calls / D::g_layers : 1;
+    const double tk = (double) std::max<long long>(1, tokens);
+    std::fprintf(stderr,
+                 "\nDS41_DEC_PROF dense (%s): %lld tokens x %d layers = %lld graph submissions, %lld kernels; "
+                 "wall %.2f ms/tok, device %.2f ms/tok (%.1f %%), host submit+sync %.2f ms/tok (%.1f %%)\n",
+                 tag, tokens, D::g_layers, tc, tn, tw / tk, td / tk, tw > 0 ? 100.0 * td / tw : 0.0,
+                 (tw - td) / tk, tw > 0 ? 100.0 * (tw - td) / tw : 0.0);
+    std::fprintf(stderr, "  %-19s %7s %7s %9s %9s %9s %9s %11s %11s\n", "graph kind", "calls/t", "kern/t", "wall_ms/t",
+                 "dev_ms/t", "host_ms/t", "us/launch", "dev_us/launch", "nodes/call");
+    for (int k = 0; k < D::G_NK; ++k) {
+        const D::Row & r = D::g_row[k];
+        if (!r.calls) continue;
+        std::fprintf(stderr, "  %-19s %7.1f %7.1f %9.3f %9.3f %9.3f %9.2f %11.2f %11.1f\n", D::kName[k],
+                     (double) r.calls / tk, (double) r.nodes / tk, r.wall_ms / tk, r.dev_ms / tk, (r.wall_ms - r.dev_ms) / tk,
+                     r.nodes ? 1000.0 * r.wall_ms / (double) r.nodes : 0.0,
+                     r.nodes ? 1000.0 * r.dev_ms / (double) r.nodes : 0.0, (double) r.nodes / (double) r.calls);
+    }
+    if (D::g_uploads)
+        std::fprintf(stderr, "  %-19s %7.1f %7s %9.3f %9s %9s %9s\n", "upload+engram", (double) D::g_uploads / tk, "1",
+                     D::g_upload_ms / tk, "-", "-", "-");
+    else
+        std::fprintf(stderr, "  %-19s %7.1f %7s %9.3f %9s %9s %9s\n", "upload+engram", (double) D::g_uploads, "1",
+                     D::g_upload_ms, "-", "-", "-");
+    if (missed) std::fprintf(stderr, "  %lld event pairs MISSED (cudaErrorNotReady on a pending pair) - the device "
+                                     "column is short by them; they are not counted as 0 ms\n", missed);
+    else std::fprintf(stderr, "  %lld event pairs read, 0 missed (every pair was complete before its read)\n", D::g_pairs);
+    for (int k = 0; k < D::G_NK; ++k) D::g_row[k] = D::Row();
+    D::g_upload_ms = 0;
+    D::g_uploads = 0;
+    D::g_pairs = 0;
 }
