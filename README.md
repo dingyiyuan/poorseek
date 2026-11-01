@@ -1,15 +1,19 @@
 # poorseek
 
-MoE4All 的一个 fork：在 MoE4All 的专家分页 / host-tier 基础设施之上，做 **DeepSeek-V4.1 的分层专家调度**，
-后端覆盖 **Vulkan（桌面 GPU）、Metal、CPU**。
+MoE4All 的一个 fork，用来做 **DeepSeek-V4.1 的推理引擎**：主攻 **SYCL 后端**（Intel GPU），
+专家分页 / host-tier 沿用 MoE4All 的基础设施。
 
 > **状态：进行中**（工作区版本 1.0.3；CHANGELOG 最近一次发布是 1.0.2 / 2026-10-15）。
+>
+> **后端分工**：SYCL 线在本仓库的 `xolotl-sycl-2026-10-24` / `xolotl-sycl-full` 分支上；
+> `main` 目前仍是继承自上游的 Vulkan / Metal / CPU 后端。Vulkan 那条线由其他人适配，
+> 本仓库不把 Vulkan 作为方向（作者已不再投入）。
 
 ## 组件（按 crate）
 
 | crate | 作用 |
 |---|---|
-| `infr-vulkan` | Vulkan compute 后端（`ash`）：`adapter` / `arena` / `caps` / `ep`，以及 `cpu_miss`——VRAM 未命中的专家走 CPU 路径 |
+| `infr-vulkan` | Vulkan compute 后端（`ash`）：`adapter` / `arena` / `caps` / `ep`，以及 `cpu_miss`——VRAM 未命中的专家走 CPU 路径。**继承自上游，不是本仓库的方向** |
 | `infr-metal` | Metal 后端 |
 | `infr-cpu` | CPU 后端 |
 | `infr-gguf` | GGUF 加载 |
@@ -34,10 +38,10 @@ MoE4All 的一个 fork：在 MoE4All 的专家分页 / host-tier 基础设施之
 
 > 本仓库目前**没有**对外发布的基准或吞吐承诺；上面引用的是仓库自身的测量记录，不构成对其他硬件/其他模型的性能声明。
 
-## 同机实测（供对照，不是本仓库的数字）
+## 同机实测（SYCL 线，Arc Pro B70 32 GB）
 
-以下是在同一台机器（Intel Arc Pro B70 32 GB + DDR5）上、用**兄弟项目 Strata 的 SYCL `dsv41` 引擎**
-跑 DeepSeek-V4.1-Flash IQ2_XXS（384K 上下文、40 层、15360 专家）得到的实测值，写在这里只作为量级参照：
+以下是在 Intel Arc Pro B70 32 GB + DDR5 上跑 DeepSeek-V4.1-Flash **IQ2_XXS**（384K 上下文、
+40 层、15360 专家）的实测值：
 
 | 场景 | 实测 |
 |---|---|
@@ -48,8 +52,8 @@ MoE4All 的一个 fork：在 MoE4All 的专家分页 / host-tier 基础设施之
 
 规模参考：100K 输入约 9–11 分钟预填充，之后解码 11–13 tok/s。
 
-> 这些是 Strata 引擎的数字，**不是 poorseek 的**。poorseek 自己的吞吐以本仓库的测量记录为准；
-> 上表只说明"这代硬件上 700B 级 MoE 在单卡能到 20 tok/s 上下"是可达的量级。
+> 口径：真实多样 prompt（短-中文 128 / 长-英文 512 / 中-中文 256 各一次，非同一 prompt 重复）；
+> 同一 prompt 重复时专家全热，会虚高到 26–27 tok/s，**不能用于配置对比**。
 
 ## 致谢
 
