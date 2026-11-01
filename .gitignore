@@ -29,3 +29,17 @@ target-prof/
 /tests/context-resource/matrix.local.json
 bili_report_work/*
 followtasks.txt
+
+# C++ / SYCL build trees
+sycl/build*/
+build-sycl*/
+build/
+*.o
+*.spv
+
+# model packs and runtime state
+ds4-slots/
+bench/
+data/
+*.gguf
+*.mkembed_bf16.bin

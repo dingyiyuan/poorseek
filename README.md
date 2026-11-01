@@ -19,8 +19,8 @@
 
 ## 状态
 
-早期、自用。SYCL 线在本仓库的分支上（`xolotl-sycl-*`）；`main` 目前仍是继承来的基础设施。
-Vulkan / Metal 后端来自最初的移植，**不是这个项目的方向**（Vulkan 那条由别人适配，我不再投入）。
+早期、自用。**SYCL 引擎就在 `main` 的 `sycl/` 里**（此前 Rust 侧的 `xolotl-sycl-*` 分支是更早的一次尝试，已被它取代）。
+Vulkan / Metal / CPU 后端在 `crates/` 里，作为控制面与后续扩展的底座保留。
 
 ## 同机参考数据
 
@@ -44,6 +44,24 @@ Vulkan / Metal 后端来自最初的移植，**不是这个项目的方向**（V
 - 稠密投影每 token 要把 6.2 GB 权重重读一遍，卡在显存带宽（约 483 GB/s），**也没有余量**。
 - 投机解码（DSpark/MTP）在本机**不划算**：接受率 100%、草稿只要 7 ms/轮，但验证一步 285 ms，因为 6 个 token 的窗口每层要 36 个专家而不是 6 个。唯一能翻正的场景是显存大到让窗口的专家全部驻留。
 - 每层解码约有 5–10 个内核串行发射，**GPU 有一半时间在等发射**（验证窗口实测 GPU 忙 50%，单 token 路径接近 100%）。
+
+
+## 仓库里有什么
+
+这是一个**完整的单卡推理框架**，两种后端并存：
+
+| 目录 | 是什么 | 语言 |
+|---|---|---|
+| `crates/` | 控制面：分页 / Slot / LUT / host-tier、模型加载、服务端、CLI、对话、剖析。**`infr-vulkan` 是 Vulkan 后端（扩展性最强的那个，保留）**，另有 Metal 与 CPU 后端 | Rust |
+| `sycl/` | **SYCL 引擎**：DeepSeek-V4.1-Flash 在 Intel Arc 上的实际推理实现（[说明](sycl/README.md)） | C++17 / oneAPI |
+| `serve/` | HTTP 服务（OpenAI 兼容接口），驱动 `sycl/` 引擎 | Python |
+| `tools/` | GGUF 打包与量化：`dsv41/pack_gguf.py`（含 DSpark drafter）、`trellis/` | Python |
+| `docs/` | 实测记录：MTP/投机解码全量数据、DeepInfer 精读报告、故障恢复清单 | Markdown |
+
+**目标配置**：Intel Arc Pro B70 32 GB + 192 GB 主机内存，DeepSeek-V4.1-Flash（40 层 × 384 路由专家，IQ2_XXS），上下文到 384 K。
+实测真实负载解码 19.5–23.2 tok/s、预填充 100 K 约 9–11 分钟（详见 [sycl/README.md](sycl/README.md) 与 [docs/MTP_STATUS_2026-11-01.md](docs/MTP_STATUS_2026-11-01.md)）。
+
+> 非官方、个人项目。不跟随任何上游的发布节奏，不提供通用安装支持。
 
 ## 组件（按 crate）
 
