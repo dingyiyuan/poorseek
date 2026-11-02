@@ -25,12 +25,51 @@ a[a.index('--pack')+1]=pack
 json.dump(c,open(cfg,'w'),indent=2,ensure_ascii=False)
 PY
 }
-restart () {
-  systemctl --user stop dsv41.service 2>/dev/null; sleep 60
-  /data/strata-new/tools/overnight/gate.sh 0 || { echo "gate 未过"; exit 1; }
-  systemctl --user start dsv41.service; sleep 15
-  systemctl --user is-active dsv41.service >/dev/null || { echo "服务没起来"; exit 1; }
+now_ms () { date +%s%3N; }
+
+wait_engine_gone () {   # 轮询直到引擎进程消失
+  local t0; t0=$(now_ms)
+  for _ in $(seq 1 240); do
+    ps -eo cmd | grep -qE '(^|/)strata-dsv41( |$)' || { echo "  [t] 引擎退出 $(( $(now_ms) - t0 )) ms"; return 0; }
+    sleep 0.25
+  done
+  echo "  [t] 警告: 引擎 60 s 未退出"; return 1
 }
+
+wait_vram_free () {     # 轮询直到显存回落到阈值以下（读不到就退化为 3 s）
+  local t0; t0=$(now_ms)
+  local f; f=$(ls /sys/class/drm/card*/device/mem_info_vram_used 2>/dev/null | head -1)
+  if [ -z "$f" ]; then local ms=${TWO_PHASE_SETTLE_MS:-1000}; sleep "$(awk "BEGIN{print $ms/1000}")"; echo "  [t] 显存不可读, 固定等 ${ms} ms (TWO_PHASE_SETTLE_MS)"; return 0; fi
+  for _ in $(seq 1 240); do
+    local used; used=$(cat "$f" 2>/dev/null || echo 0)
+    if [ "${used:-0}" -lt 2147483648 ]; then echo "  [t] 显存释放 $(( $(now_ms) - t0 )) ms (used $(( used/1048576 )) MiB)"; return 0; fi
+    sleep 0.25
+  done
+  echo "  [t] 警告: 显存 60 s 未释放"; return 1
+}
+
+wait_health () {        # 轮询直到 HTTP 就绪
+  local t0; t0=$(now_ms)
+  for _ in $(seq 1 480); do
+    curl -sf --max-time 2 http://127.0.0.1:8160/health >/dev/null 2>&1 && { echo "  [t] 服务就绪 $(( $(now_ms) - t0 )) ms"; return 0; }
+    sleep 0.25
+  done
+  echo "  [t] 警告: 服务 120 s 未就绪"; return 1
+}
+
+restart () {            # 轮询真实条件, 不再固定 sleep 60。
+  # 实测: 引擎退出 14-56 ms, 服务就绪 0.8-2.2 s, 单次切换 4.5-6 s (曾用固定 60 s 冷却)。
+  # TWO_PHASE_SETTLE_MS 是"显存不可读"时的保险等待, 默认 1000; 实测 500 也安全。
+  local t0; t0=$(now_ms)
+  systemctl --user stop dsv41.service 2>/dev/null
+  wait_engine_gone; wait_vram_free
+  /data/strata-new/tools/overnight/gate.sh 0 || { echo "gate 未过"; exit 1; }
+  systemctl --user start dsv41.service
+  wait_health
+  systemctl --user is-active dsv41.service >/dev/null || { echo "服务没起来"; exit 1; }
+  echo "  [t] 切换总耗时 $(( $(now_ms) - t0 )) ms"
+}
+
 ask () {  # $1 = messages json, $2 = tag
   python3 - "$1" "$MAXTOK" "$2" <<'PY'
 import json,urllib.request,time,sys
