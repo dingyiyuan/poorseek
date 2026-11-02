@@ -83,6 +83,23 @@ print(f"[{tag}] wall {wall:.1f}s | out {len(txt)} chars | {txt[:80]!r}")
 PY
 }
 
+# ---- 自动决策：短提示不值得切换 ----
+# 盈亏平衡: 切换 5 s / (1/367 - 1/416) tok/s ≈ 15,600 token（367=IQ2 122k 参考值, 416=混合包）
+# 估计值用 len/3（英文为主）；阈值留 2x 余量，估偏了也不至于做错决策。
+EST_TOK=$(( $(wc -c < "$PROMPT_FILE" 2>/dev/null || echo 0) / 3 ))
+MIN_TOK=${TWO_PHASE_MIN_TOKENS:-15000}
+echo "[自动决策] 提示约 ${EST_TOK} token，阈值 ${MIN_TOK}"
+if [ "$EST_TOK" -lt "$MIN_TOK" ]; then
+  echo "[自动决策] 短输入 → 直接单段式（IQ2，不切换）"
+  set_pack "$PACK_DEC"; restart
+  PROMPT=$(cat "$PROMPT_FILE")
+  MSGS1=$(python3 -c 'import json,sys; print(json.dumps([{"role":"user","content":sys.argv[1]}]))' "$PROMPT")
+  ask "$MSGS1" "single-phase-iq2"
+  echo "[自动决策] 完成（未使用混合包）"
+  exit 0
+fi
+echo "[自动决策] 长输入 → 两段式（混合包预填充 + IQ2 解码）"
+
 echo "=== ① 预填充：混合 MXFP4 包 ==="
 set_pack "$PACK_FAST"; restart
 PROMPT=$(cat "$PROMPT_FILE")
