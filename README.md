@@ -94,3 +94,38 @@ Vulkan / Metal / CPU 后端在 `crates/` 里，作为控制面与后续扩展的
 
 本仓库的修改与整体发行采用 [Apache License 2.0](LICENSE)；继承自上游的代码保留其原始
 [MIT License](LICENSE-MIT) 与版权声明，详细归属见 [NOTICE](NOTICE)。
+
+## 阶段感知混合精度（预填充 / 解码分开配置）
+
+DeepSeek 官方 checkpoint 里的路由专家是 **FP4(E2M1) + E8M0/32**，与 ggml MXFP4 同构，引擎已有该格式的内核。
+所以我们把**前 20 层专家换成官方 FP4、后 20 层保持 IQ2**，打成一个"预填充专用包"：
+
+| | IQ2 包（生产） | 混合包（L0–19 官方 FP4） |
+|---|---|---|
+| 专家内核耗时（122 K 预填充） | 72.7 s | **56.8 s（−22%）** |
+| 122 K 预填充（端到端参考） | 367 tok/s | 416 tok/s |
+| **解码** | ~21 tok/s | **6.74 tok/s（不可用）** |
+
+解码掉到 6.74 的原因：MXFP4 每专家 blob 18.80 MB vs IQ2 的 7.74–10.23 MB，
+显存按最大 blob 分槽 → 驻留槽位从约 40/层掉到约 25/层，大量专家改为从盘读。
+
+**所以它只当预填充包用**，解码换回 IQ2。切换靠引擎自带的会话存档（含 KV）：
+
+```
+① 混合包 → 预填充 → slot_save（含 KV）
+② 换 pack，重启引擎（约 10 s + 60 s 安全冷却）
+③ IQ2 包 → slot_load → 解码（21 tok/s，原样）
+```
+
+已实测 **KV 可以跨 pack 承接**：换包重启后 839 token 的请求有 **822 个复用**，只新读 17 个
+（专家格式不同，但 KV 布局与它无关）。工具：`tools/dsv41/two_phase.sh`、`tools/dsv41/mixed_pack.py`。
+
+短输入不划算（切换开销约 70 s，滚雪球到 30 K token 以上才回本），应按提示长度自动选择。
+
+> 精度上不亏：前 20 层从 IQ2 提升到官方 FP4，后 20 层不变；实测 IQ2 解码在这套模型的推理题上
+> 没有可测量的损失（12 道硬题 11/12 vs 全精度 12/12，唯一的差异是我的答案提取器把 `9 sheep are left`
+> 读成了 `left`）。IQ2 的量化损失要上千道题才测得出来，与文献里 GSM8K 上 1–4 分的量级一致。
+
+工具链（都在 `tools/` 下）：`mixed_pack.py`（safetensors→混合包，逐位校验 max err = 0）、
+`two_phase.sh`（两段式编排）、`overnight/gpu_lock.sh`（多 agent 时的 GPU 独占锁）、
+`iq_bench.py` / `iq_hard.json`（可自动判分的智商基准）。

@@ -1,0 +1,14 @@
+[
+ {"id":1,"q":"How many positive integers n < 1000 have exactly 6 positive divisors?","gold":"?"},
+ {"id":2,"q":"A 4x4x4 cube is painted red on all faces, then cut into 64 unit cubes. How many unit cubes have 0 painted faces and also touch an internal edge? Answer with one number only.","gold":"?"},
+ {"id":3,"q":"Find the number of ordered pairs of positive integers (a,b) with a*b = 2^5 * 3^4 * 5^2.","gold":"?"},
+ {"id":4,"q":"In how many ways can 8 people sit around a round table if two particular people refuse to sit next to each other?","gold":"?"},
+ {"id":5,"q":"Compute the sum of all positive divisors of 2016.","gold":"?"},
+ {"id":6,"q":"A ladder of length 5 m leans against a wall, its base 3 m from the wall. The base slides outward 1 m. How far down does the top slide, exactly? Answer as a decimal with 3 places.","gold":"?"},
+ {"id":7,"q":"Three boxes: one labeled 'Apples', one 'Oranges', one 'Mixed'. All labels are wrong. You draw one fruit from one box and see an apple. Which box should you then take from to know all contents? Answer: Apples / Oranges / Mixed.","gold":"?"},
+ {"id":8,"q":"What is the 100th digit after the decimal point of 1/7?","gold":"?"},
+ {"id":9,"q":"A farmer has 17 sheep; all but 9 run away. How many remain?","gold":"?"},
+ {"id":10,"q":"Find the last two digits of 7^2026.","gold":"?"},
+ {"id":11,"q":"If f(x) = x^2 - 3x + 2, and f(f(f(4))) = N, what is N?","gold":"?"},
+ {"id":12,"q":"A bag has 3 red and 5 blue balls. You draw 3 without replacement. What is the probability all three are red? Answer as a fraction a/b.","gold":"?"}
+]
