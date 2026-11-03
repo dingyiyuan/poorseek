@@ -1,0 +1,24 @@
+
+== ty 16  gu  (n_embd 2560, n_ff 1280, K 2560, n_out 2560, real) ==
+     M    deq ms    mkl ms   both ms  fused ms   2ph TF/s fused TF/s  2ph/fus
+     1   xmx_gemm_iq refused this shape
+     8   xmx_gemm_iq refused this shape
+    32   xmx_gemm_iq refused this shape
+    96   xmx_gemm_iq refused this shape
+   256   xmx_gemm_iq refused this shape
+   512   xmx_gemm_iq refused this shape
+   900   xmx_gemm_iq refused this shape
+  1800   xmx_gemm_iq refused this shape
+  列义: 2ph/fus = fused 耗时 / 两段式耗时，> 1 表示两段式更快
+
+== ty 16  down  (n_embd 2560, n_ff 1280, K 1280, n_out 2560, real) ==
+     M    deq ms    mkl ms   both ms  fused ms   2ph TF/s fused TF/s  2ph/fus
+     1   xmx_gemm_iq refused this shape
+     8   xmx_gemm_iq refused this shape
+    32   xmx_gemm_iq refused this shape
+    96   xmx_gemm_iq refused this shape
+   256   xmx_gemm_iq refused this shape
+   512   xmx_gemm_iq refused this shape
+   900   xmx_gemm_iq refused this shape
+  1800   xmx_gemm_iq refused this shape
+  列义: 2ph/fus = fused 耗时 / 两段式耗时，> 1 表示两段式更快

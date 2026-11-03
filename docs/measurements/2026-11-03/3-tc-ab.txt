@@ -1,0 +1,18 @@
+GPU 锁已取得: tc-ab
+=== base ===
+  [t] 就绪 1047 ms
+[base] 请求失败: HTTP Error 401: Unauthorized
+=== tc ===
+  [t] 就绪 775 ms
+[tc] 请求失败: HTTP Error 401: Unauthorized
+=== tc16 ===
+  [t] 就绪 1899 ms
+[tc16] 请求失败: HTTP Error 401: Unauthorized
+
+================ 对照 ================
+tag        wall s prompt tok  prefill tok/s  out tok
+
+判据: tc 的 wall 比 base 小 ≥1.3x 且输出正常 -> 张量核值得；输出胡话 -> 直译错误，看 xmx_gemm_bench 的小 M 对拍
+原始引擎日志: /tmp/tc-ab.WB37d9/*.engine.log
+[还原] /data/models/dsv41-iq2xxs-pack-real/strata-server.json
+GPU 锁已释放: tc-ab

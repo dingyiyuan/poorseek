@@ -1,0 +1,16 @@
+2026-11-03 09:1x, Arc Pro B70（重启后），IQ2_XXS，6 experts
+命令：ds4_iq_test_tc --bench-tiles 16 6 96,900   （STRATA_DS4_NO_TC=1 固定走 F32 融合路径）
+
+融合（基线）：                      两段式（DS4_EXP_2PHASE=1）：
+96 行  gate/up 10023.7 us          96 行  gate/up  2729.0 us   -> 3.67x
+96 行  down     2567.9 us          96 行  down     1165.9 us   -> 2.20x
+900 行 gate/up 58257.4 us          900 行 gate/up  3992.3 us   -> 14.59x
+900 行 down    16968.3 us          900 行 down     2053.5 us   -> 8.26x
+
+900 行合计：75225.7 us -> 6045.8 us  = 12.44x
+
+数值对拍（--type 16, MINROWS=1）：set gate_up 3.34e-04 (tol 1e-02)、set down 1.42e-04 (tol 3e-03)，ALL OK
+（对照融合路径：7.02e-03 / 4.19e-04 —— 两段式反而更准，因为 f16 权重 + f32 累加）
+
+RM=128 反例（同一binary）：数值一致但 96 行 10023->40228 us、900 行 58257->290512 us，
+即慢 4-5x：真内核里 RT 4->8 造成寄存器溢出，微基准（无 MMA、无寄存器压力）不能外推。

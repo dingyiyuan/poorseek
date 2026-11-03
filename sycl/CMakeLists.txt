@@ -431,8 +431,6 @@ if(STRATA_SYCL_PARITY)
   target_link_libraries(sycl_payload_pairs PRIVATE strata_kernels)
   add_test(NAME sycl_payload_pairs COMMAND sycl_payload_pairs)
   set_tests_properties(sycl_payload_pairs PROPERTIES ENVIRONMENT "STRATA_SYCL_A770_FAST=1;STRATA_DOORBELL_CHECK=1")   # opt-in paths; publish_res copies x only with the check
-  add_executable(xmx_gemm_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/xmx_gemm_bench.cpp)   # XMX quantized GEMM vs dequant+oneMKL
-  target_link_libraries(xmx_gemm_bench PRIVATE strata_kernels strata_prefill)   # -qmkl for the oneMKL reference
   add_executable(xmx_group_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/xmx_group_parity.cpp)   # A770: fused grouped XMX
   target_link_libraries(xmx_group_parity PRIVATE strata_kernels strata_prefill)
   add_executable(esimd_moe_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/esimd_moe_parity.cpp)   # 151-b70: fused int8 expert products vs dequant+oneMKL and FP64
@@ -499,7 +497,9 @@ if(STRATA_SYCL_DSV41)
   target_link_options(strata-dsv41 PRIVATE -qmkl=sequential)
   # the tensor-core expert kernel (nvcuda::wmma -> dpct joint_matrix) is not written for this compiler yet: the plain
   # F32 kernel serves the prompt (same results, slower prompt).  See sycl/tools/port_dsv41_fixes.py.
-  target_compile_definitions(strata-dsv41 PRIVATE STRATA_DSV41_TQ_CPU=1 $<$<NOT:$<BOOL:${STRATA_SYCL_DSV41_TC}>>:STRATA_DSV41_NO_TC=1> DS4_BUILD_ID="sycl-port")
+  target_compile_definitions(strata-dsv41 PRIVATE STRATA_DSV41_TQ_CPU=1 $<$<NOT:$<BOOL:${STRATA_SYCL_DSV41_TC}>>:STRATA_DSV41_NO_TC=1> DS4_BUILD_ID="sycl-port"
+    DS4_HAVE_MKL_GEMM=1)   # 两段式专家 GEMM（DS4_EXP_2PHASE=1 才生效，默认关）
+  target_link_libraries(strata-dsv41 PRIVATE strata_kernels)   # 两段式要用 iq_dequant_f16 解到 f16 scratch
   # EXL3_TC is read only in vendor/exl3.cu, so the option costs one translation unit rather than the whole target
   # (strata_resolve hands the target the migrated .dp.cpp by its absolute path: a property on the .cu name, or on a
   # relative path, never matches it - the first version of these two options therefore built the same binary)
@@ -590,6 +590,20 @@ if(STRATA_SYCL_DSV41)
   target_link_libraries(ds4_iq_test PRIVATE strata_kernels_cpu)
   target_compile_definitions(ds4_iq_test PRIVATE STRATA_DSV41_TQ_CPU=1 STRATA_DSV41_NO_TC=1)
   message(STATUS "Strata SYCL: ds4_iq_test (the DeepSeek-V4.1 i-quant kernels on the card)")
+  # 同一套对拍，但**不**定义 NO_TC：set_tc_kernel（张量核专家内核）编进来，运行期用 STRATA_DS4_TC=1 打开。
+  # 这是打开张量核之前的第一道正确性门：token 路径、window 路径、prompt set 路径都会拿 ggml 解码 + double 参考对拍。
+  # 只在 STRATA_SYCL_DSV41_TC=ON 的构建里生成（否则 set_tc_kernel 根本不存在）。
+  if(STRATA_SYCL_DSV41_TC)
+    add_executable(ds4_iq_test_tc ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/iq_expert_test.cpp ${_ds4_test})
+    target_include_directories(ds4_iq_test_tc PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41
+      ${STRATA_ROOT}/src/dsv41 ${STRATA_ROOT}/include ${STRATA_ROOT}/third_party/ggml ${STRATA_ROOT}/src/kernels/cpu)
+    target_link_libraries(ds4_iq_test_tc PRIVATE strata_kernels_cpu strata_kernels)
+    target_compile_definitions(ds4_iq_test_tc PRIVATE STRATA_DSV41_TQ_CPU=1 DS4_HAVE_MKL_GEMM=1)
+    target_compile_options(ds4_iq_test_tc PRIVATE -qmkl=sequential)   # 两段式的 oneMKL 半
+    target_link_options(ds4_iq_test_tc PRIVATE -qmkl=sequential)
+    message(STATUS "Strata SYCL: ds4_iq_test_tc (the same parity, with the tensor-core expert kernels compiled in)")
+  endif()
   # the DENSE matvec (iq::mv): the shared expert, the head, the hc projections.  iq_expert_test cannot reach the K-quants
   # ("gate_up refused"), and layer 27's Q5_K shared expert is where the port's first light lost its numbers.
   strata_resolve(_ds4_mv src/dsv41/ds4_iq.cu src/dsv41/ds4_tq.cu)
@@ -608,4 +622,18 @@ if(STRATA_SYCL_DSV41)
     target_compile_features(ds4_${_t}_test PRIVATE cxx_std_17)
     add_test(NAME ds4_${_t}_test COMMAND ds4_${_t}_test)
   endforeach()
+endif()
+
+# XMX quantized GEMM vs dequant+oneMKL（从 STRATA_SYCL_PARITY 区里挪出来：只依赖 strata_kernels/strata_prefill）
+if(TARGET strata_kernels)
+  add_executable(xmx_gemm_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/xmx_gemm_bench.cpp)
+  target_link_libraries(xmx_gemm_bench PRIVATE strata_kernels strata_prefill)
+  target_compile_options(xmx_gemm_bench PRIVATE -qmkl=sequential)   # dpct::blas::gemm（两段式的 oneMKL 半）
+  target_link_options(xmx_gemm_bench PRIVATE -qmkl=sequential)
+endif()
+
+# IQ2_XXS 解量化微基准（独立：只依赖 SYCL，不链引擎库，不加载模型）
+if(TARGET strata_kernels)
+  add_executable(iq_dequant_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/iq_dequant_bench.cpp)
+  target_link_libraries(iq_dequant_bench PRIVATE strata_kernels)
 endif()

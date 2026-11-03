@@ -5,6 +5,11 @@
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#if defined(DS4_HAVE_MKL_GEMM)   // 两段式专家 GEMM 需要 oneMKL；没有它的 target 会自动回退到融合路径
+#include <dpct/blas_utils.hpp>
+#include <oneapi/mkl.hpp>
+#include "strata/kernels/iq_kernels.hpp"   // iq_dequant_f16：把专家权重解到 f16 scratch
+#endif
 #include "ds4_launch.h" // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
 #include "ds4_iq.dp.hpp"
 #if defined(STRATA_METAL)
@@ -1814,6 +1819,27 @@ void light_kernel_rows_wrapper(const SetArgs a, const int8_t *__restrict xq,
     });
 }
 
+// 只开一半的张量核：STRATA_DS4_TC_ONLY=gu|down（默认两半都开）。
+// 用处在排错：对拍失败时先确定是 gate_up 还是 down 的瓦片不对，不用整台引擎来回试。
+static bool tc_side_ok(int side) {   // 0 = gate_up, 1 = down
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_DS4_TC_ONLY");
+        if (e == nullptr) return 3;                      // 两边都开
+        if (std::strcmp(e, "gu") == 0) return 1;
+        if (std::strcmp(e, "down") == 0) return 2;
+        return 3;
+    }();
+    return (v & (side == 0 ? 1 : 2)) != 0;
+}
+// 张量核瓦片是 BM 行见方，行数太少（解码只有 1 行）反而慢：STRATA_DS4_TC_MINROWS 设个下限，
+// 0（默认）= 不做限制，明早 A/B 用 STRATA_DS4_TC_MINROWS=16 之类把解码留在 F32 路径上
+static int tc_min_rows() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_DS4_TC_MINROWS");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    return v;
+}
 bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later, STRATA_DS4_NO_TC=1 keeps the F32 kernel
 #if defined(STRATA_USE_HIP)
     return false;
@@ -1827,8 +1853,14 @@ bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later, STRATA_DS4_NO_TC=1 keeps 
     if (v == 0) {
         int major = 0;
         major = dpct::get_device(dev).get_major_version();
-        const char* e = std::getenv("STRATA_DS4_NO_TC");
-        v = major >= 7 && !(e != nullptr && e[0] == '1') ? 1 : 2;
+        // [SYCL] sm_70 的判据在这里失效：dpct 的 get_major_version() 解的是 OpenCL 版本串
+        // （"OpenCL 3.0" -> 3），所以 major >= 7 对 Intel 显卡恒为假，张量核专家内核虽然编译进来了
+        // 却永远不会被调用（实测 4.2 TFLOPS 的 F32 内核就是这条分支的结果）。
+        // 改成显式 opt-in：STRATA_DS4_TC=1 打开张量核；STRATA_DS4_NO_TC=1 仍然最优先关掉。
+        const char* off = std::getenv("STRATA_DS4_NO_TC");
+        const char* on = std::getenv("STRATA_DS4_TC");
+        const bool tcen = major >= 7 || (on != nullptr && on[0] == '1');
+        v = tcen && !(off != nullptr && off[0] == '1') ? 1 : 2;
         state[dev].store(v, std::memory_order_relaxed);
     }
     return v == 1;
@@ -1960,7 +1992,7 @@ void launch_set(const SetArgs &a, dpct::dim3 grid, dpct::queue_ptr s) {
     if (hipk::launch<T, GU>(a, s)) return;   // (gfx12, STRATA_DS4_HIPK=1: the matrix-core tiles)
 #endif
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_DSV41_NO_TC)
-    if (tc_ok()) {
+    if (tc_ok() && tc_side_ok(GU ? 0 : 1) && a.max_rows >= tc_min_rows()) {
         strata_ds4_launch(set_tc_kernel_wrapper<T, GU>, grid, kThreads, 0, s,
                           a);
         return;
@@ -1971,6 +2003,20 @@ void launch_set(const SetArgs &a, dpct::dim3 grid, dpct::queue_ptr s) {
         strata_ds4_launch(set_kernel_wrapper<T, GU, 16>, grid, kThreads, 0, s,
                           a);
         return;
+    }
+    // 128 行一块：同一份专家权重被重复解量化的次数从 ceil(rows/64) 降到 ceil(rows/128)。
+    // 11-03 早上的瓦片微基准给的证据：BM64 隐含 13.6 TFLOPS、BM128 隐含 46.7 TFLOPS。
+    // set_kernel 的 RM 是模板参数（局部内存也按 RM 开），所以这里只是换一个实例化，不动常量。
+    {
+        static const bool rm128 = [] {
+            const char* e = std::getenv("DS4_IQ_RM128");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (rm128 && a.max_rows > 64) {
+            grid.x = (unsigned) ((a.max_rows + 127) / 128);
+            strata_ds4_launch(set_kernel_wrapper<T, GU, 128>, grid, kThreads, 0, s, a);
+            return;
+        }
     }
     strata_ds4_launch(set_kernel_wrapper<T, GU>, grid, kThreads, 0, s, a);
 }
@@ -2565,7 +2611,200 @@ long long hipk_launches() {
 #endif
 }
 
+// ============== 两段式专家 GEMM（默认关；设计见 docs/TWOPHASE_EXPERTS_DESIGN.md）==============
+// 融合路径里，同一份专家权重被 ceil(rows/BM) 个行块各解一遍（rows=900 → 15 遍）。两段式每个专家只解一次，
+// 解到 f16 scratch 后直接走 oneMKL 的 f16 GEMM。只对行数多的集合生效——解码绝不能走这条路。
+static bool exp2p_on() {
+    static const bool v = [] {
+        const char* e = std::getenv("DS4_EXP_2PHASE");
+        return e != nullptr && e[0] == '1';
+    }();
+    return v;
+}
+static int exp2p_min_rows() {
+    static const int v = [] {
+        const char* e = std::getenv("DS4_EXP_2PHASE_MINROWS");
+        return e != nullptr ? std::atoi(e) : 96;
+    }();
+    return v;
+}
+
+#if defined(DS4_HAVE_MKL_GEMM)
+namespace {
+// 激活 gather + f32→f16：xg[r][c] = half(xf[idx[r] * ldx + c])
+struct KGatherF16 {
+    const float* xf; const int* idx; int cols, ldx; sycl::half* out;
+    void operator()(sycl::id<2> i) const {
+        const int r = (int) i[0], c = (int) i[1];
+        out[(size_t) r * cols + c] = sycl::half(xf[(size_t) idx[r] * ldx + c]);
+    }
+};
+// swiglu(g, u, limit) → a.h（half，步长 ldo）
+struct KSwiglu {
+    const float* g; const float* u; float limit; int cols, ldo; sycl::half* out;
+    void operator()(sycl::id<2> i) const {
+        const int r = (int) i[0], c = (int) i[1];
+        out[(size_t) r * ldo + c] = sycl::half(swiglu(g[(size_t) r * cols + c], u[(size_t) r * cols + c], limit));
+    }
+};
+// f32 scratch → a.y（步长 ldo）
+struct KCopyF32 {
+    const float* src; int cols, ldo; float* out;
+    void operator()(sycl::id<2> i) const {
+        const int r = (int) i[0], c = (int) i[1];
+        out[(size_t) r * ldo + c] = src[(size_t) r * cols + c];
+    }
+};
+
+struct TwoPhaseBuf {
+    sycl::half *dwg = nullptr, *dwu = nullptr, *dwd = nullptr, *xg = nullptr;
+    float *yg = nullptr, *yu = nullptr, *yd = nullptr;
+    size_t n_embd = 0, n_ff = 0, rows = 0;
+};
+std::mutex g_2p_mu;
+std::map<std::pair<int, dpct::queue_ptr>, TwoPhaseBuf> g_2p;
+
+// 引擎的约定：stream 传 0 表示默认队列（其它地方都由 strata_ds4_launch 包装掉）。我们直接调 SYCL，
+// 必须先归一化，否则 *s 解引用空指针 —— 对拍工具就是这么传的（set_gate_up(q, 0)）。
+static sycl::queue& exp2p_queue(dpct::queue_ptr s) { return s != nullptr ? *s : dpct::get_in_order_queue(); }
+
+// 每 (device, queue) 一份 scratch；几何变了才重分配（n_embd/n_ff/rows 只会变大）
+static TwoPhaseBuf* exp2p_buf(dpct::queue_ptr s, size_t n_embd, size_t n_ff, size_t rows) {
+    sycl::queue& q = exp2p_queue(s);
+    std::lock_guard<std::mutex> lk(g_2p_mu);
+    TwoPhaseBuf& b = g_2p[{dpct::get_current_device_id(), s}];
+    if (b.dwg != nullptr && b.n_embd >= n_embd && b.n_ff >= n_ff && b.rows >= rows) return &b;
+    if (b.dwg != nullptr) {   // 几何变大：整组重来（调用点保证不在 GPU 作业中途）
+        sycl::free(b.dwg, q); sycl::free(b.dwu, q); sycl::free(b.dwd, q); sycl::free(b.xg, q);
+        sycl::free(b.yg, q); sycl::free(b.yu, q); sycl::free(b.yd, q);
+        b = TwoPhaseBuf{};
+    }
+    b.n_embd = n_embd; b.n_ff = n_ff; b.rows = rows;
+    b.dwg = sycl::malloc_device<sycl::half>(n_ff * n_embd, q);
+    b.dwu = sycl::malloc_device<sycl::half>(n_ff * n_embd, q);
+    b.dwd = sycl::malloc_device<sycl::half>(n_embd * n_ff, q);
+    b.xg  = sycl::malloc_device<sycl::half>(rows * n_embd, q);
+    b.yg  = sycl::malloc_device<float>(rows * n_ff, q);
+    b.yu  = sycl::malloc_device<float>(rows * n_ff, q);
+    b.yd  = sycl::malloc_device<float>(rows * n_embd, q);
+    if (b.dwg == nullptr || b.dwu == nullptr || b.dwd == nullptr || b.xg == nullptr || b.yg == nullptr ||
+        b.yu == nullptr || b.yd == nullptr)
+        return nullptr;
+    return &b;
+}
+
+// C[n_out x rows] (float) = W[n_out x K] (half) · X[rows x K] (half)^T
+static void exp2p_gemm(const sycl::half* W, int lda, const sycl::half* X, int ldb, float* C, int ldc, int n_out,
+                       int rows, int K, dpct::queue_ptr s) {
+    static std::mutex gm;
+    std::lock_guard<std::mutex> lk(gm);
+    static std::map<dpct::queue_ptr, dpct::blas::descriptor_ptr> hs;
+    dpct::blas::descriptor_ptr& h = hs[s];
+    sycl::queue& q = exp2p_queue(s);
+    if (!h) { h = new dpct::blas::descriptor(); h->set_queue(&q); }
+    const float alpha = 1.0f, beta = 0.0f;
+    dpct::blas::gemm(h, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans, n_out, rows, K, &alpha,
+                     W, dpct::library_data_t::real_half, lda, X, dpct::library_data_t::real_half, ldb, &beta, C,
+                     dpct::library_data_t::real_float, ldc, dpct::compute_type::f32);
+}
+
+
+// 只为归因实验：把两段式的解量化重复 N 遍（默认 1）。N=ceil(rows/64) 就能模拟融合路径的重复解量化，
+// 从而把"省掉 14 遍解量化"和"换到 oneMKL/XMX"两个效应分开测量。
+static int exp2p_dup() {
+    static const int v = [] {
+        const char* e = std::getenv("DS4_EXP_2PHASE_DUP");
+        return e != nullptr ? std::max(1, std::atoi(e)) : 1;
+    }();
+    return v;
+}
+
+// SetArgs::bounds 是**设备内存**（引擎里 d_bounds、对拍工具里 hipMalloc）。融合内核在设备端读它没问题，
+// 但两段式是 host 侧控制流，直接 a.bounds[e] 就是读设备 USM → 段错误（11-03 早上把卡搞掉的那次）。
+// 所以每次调用先整份拷回 host（n_exp+1 个 int，最多 1.5 KB，代价可忽略）。
+static bool exp2p_host_bounds(dpct::queue_ptr s, const SetArgs& a, std::vector<int>& hb) {
+    if (a.bounds == nullptr || a.n_exp <= 0) return false;
+    hb.resize((size_t) a.n_exp + 1);
+    exp2p_queue(s).memcpy(hb.data(), a.bounds, hb.size() * sizeof(int)).wait();
+    return true;
+}
+
+// 实验路径的第一原则：不许把引擎带走。任何异常都要落回融合内核，并且只提示一次。
+static void exp2p_warn(const char* what, const char* why) {
+    static std::mutex m;
+    static bool done[2] = {false, false};
+    const int i = (what != nullptr && what[0] == 'd') ? 1 : 0;
+    std::lock_guard<std::mutex> lk(m);
+    if (done[i]) return;
+    done[i] = true;
+    std::fprintf(stderr, "two-phase %s failed (%s): falling back to the fused kernel\n", what, why);
+}
+
+bool set_gate_up_2ph(const SetArgs& a, dpct::queue_ptr s) {
+    // iq_dequant_f16 对非 IQ 类型会 std::exit(1)：类型不对就老老实实回退，绝不能让它把引擎带走
+    if (!supported(a.tg) || a.xf == nullptr || a.idx == nullptr || a.h == nullptr) return false;
+    if (a.n_embd % 256 != 0 || a.n_ff % 256 != 0) return false;
+    TwoPhaseBuf* b = exp2p_buf(s, (size_t) a.n_embd, (size_t) a.n_ff, (size_t) std::max(1, a.max_rows));
+    if (b == nullptr) return false;
+    std::vector<int> hb;
+    if (!exp2p_host_bounds(s, a, hb)) return false;
+    for (int e = 0; e < a.n_exp; ++e) {
+        const int lo = hb[e] - a.row0, hi = hb[e + 1] - a.row0;
+        const int rows = hi - lo;
+        if (rows <= a.skip_le) continue;   // light 路径已经做过
+        const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+        const int K = a.n_embd, N = a.n_ff;
+        for (int rep = 0, nd = exp2p_dup(); rep < nd; ++rep) {
+            strata::kernels::iq_dequant_f16(a.tg, blob + a.tr[0], (int64_t) N * K, (uint16_t*) b->dwg, s);
+            strata::kernels::iq_dequant_f16(a.tg, blob + a.tr[1], (int64_t) N * K, (uint16_t*) b->dwu, s);
+        }
+        exp2p_queue(s).parallel_for(sycl::range<2>((size_t) rows, (size_t) K),
+                                    KGatherF16{a.xf, a.idx + lo, K, a.ldx, b->xg});
+        exp2p_gemm(b->dwg, K, b->xg, K, b->yg, N, N, rows, K, s);
+        exp2p_gemm(b->dwu, K, b->xg, K, b->yu, N, N, rows, K, s);
+        exp2p_queue(s).parallel_for(sycl::range<2>((size_t) rows, (size_t) N),
+                                    KSwiglu{b->yg, b->yu, a.limit, N, a.ldo,
+                                            (sycl::half*) (a.h + (size_t) lo * a.ldo)});
+    }
+    return true;
+}
+
+bool set_down_2ph(const SetArgs& a, dpct::queue_ptr s) {
+    if (!supported(a.td) || a.xh == nullptr || a.y == nullptr) return false;
+    if (a.n_embd % 256 != 0 || a.n_ff % 256 != 0) return false;
+    TwoPhaseBuf* b = exp2p_buf(s, (size_t) a.n_embd, (size_t) a.n_ff, (size_t) std::max(1, a.max_rows));
+    if (b == nullptr) return false;
+    std::vector<int> hb;
+    if (!exp2p_host_bounds(s, a, hb)) return false;
+    for (int e = 0; e < a.n_exp; ++e) {
+        const int lo = hb[e] - a.row0, hi = hb[e + 1] - a.row0;
+        const int rows = hi - lo;
+        if (rows <= a.skip_le) continue;
+        const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+        const int K = a.n_ff, N = a.n_embd;
+        for (int rep = 0, nd = exp2p_dup(); rep < nd; ++rep)
+            strata::kernels::iq_dequant_f16(a.td, blob + a.tr[2], (int64_t) N * K, (uint16_t*) b->dwd, s);
+        exp2p_gemm(b->dwd, K, (const sycl::half*) (a.xh + (size_t) lo * a.ldx), a.ldx, b->yd, N, N, rows, K, s);
+        exp2p_queue(s).parallel_for(sycl::range<2>((size_t) rows, (size_t) N),
+                                    KCopyF32{b->yd, N, a.ldo, a.y + (size_t) lo * a.ldo});
+    }
+    return true;
+}
+}  // namespace
+#endif  // DS4_HAVE_MKL_GEMM
+
 bool set_gate_up(const SetArgs &a, dpct::queue_ptr s) {
+#if defined(DS4_HAVE_MKL_GEMM)
+    if (exp2p_on() && a.max_rows >= exp2p_min_rows()) {
+        try {
+            if (set_gate_up_2ph(a, s)) return true;
+        } catch (const std::exception& e) {
+            exp2p_warn("gate/up", e.what());
+        } catch (...) {
+            exp2p_warn("gate/up", "unknown exception");
+        }
+    }
+#endif
 #if defined(STRATA_METAL)
     if (a.hbounds != nullptr && ::strata::dsv41::metal_host::iq_set_gu(a.wbase, a.stride, a.tr, a.hbounds, a.n_exp, a.total_rows, a.n_embd, a.n_ff, a.limit, a.xf, a.ldx, a.idx, a.h, a.ldo, a.tg, a.td))
         return true;
@@ -2586,6 +2825,17 @@ bool set_gate_up(const SetArgs &a, dpct::queue_ptr s) {
 }
 
 bool set_down(const SetArgs &a, dpct::queue_ptr s) {
+#if defined(DS4_HAVE_MKL_GEMM)
+    if (exp2p_on() && a.max_rows >= exp2p_min_rows()) {
+        try {
+            if (set_down_2ph(a, s)) return true;
+        } catch (const std::exception& e) {
+            exp2p_warn("down", e.what());
+        } catch (...) {
+            exp2p_warn("down", "unknown exception");
+        }
+    }
+#endif
 #if defined(STRATA_METAL)
     if (a.hbounds != nullptr && ::strata::dsv41::metal_host::iq_set_dn(a.wbase, a.stride, a.tr, a.hbounds, a.n_exp, a.total_rows, a.n_embd, a.n_ff, a.limit, a.xh, a.ldx, a.y, a.ldo, a.tg, a.td))
         return true;

@@ -1707,6 +1707,27 @@ __global__ void __launch_bounds__(kThreads) mx_set_wmma_kernel(const SetK a) {
     }
 }
 #endif
+// 只开一半的张量核：STRATA_DS4_TC_ONLY=gu|down（默认两半都开）。
+// 用处在排错：对拍失败时先确定是 gate_up 还是 down 的瓦片不对，不用整台引擎来回试。
+static bool tc_side_ok(int side) {   // 0 = gate_up, 1 = down
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_DS4_TC_ONLY");
+        if (e == nullptr) return 3;                      // 两边都开
+        if (std::strcmp(e, "gu") == 0) return 1;
+        if (std::strcmp(e, "down") == 0) return 2;
+        return 3;
+    }();
+    return (v & (side == 0 ? 1 : 2)) != 0;
+}
+// 张量核瓦片是 BM 行见方，行数太少（解码只有 1 行）反而慢：STRATA_DS4_TC_MINROWS 设个下限，
+// 0（默认）= 不做限制，明早 A/B 用 STRATA_DS4_TC_MINROWS=16 之类把解码留在 F32 路径上
+static int tc_min_rows() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_DS4_TC_MINROWS");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    return v;
+}
 bool tc_ok() try { // sm_70 and later (WMMA F16) / AMD gfx11, gfx12 (wave32
                    // WMMA); STRATA_DS4_NO_TC=1 keeps the F32 kernel
 #if defined(STRATA_USE_HIP)
@@ -1728,8 +1749,12 @@ bool tc_ok() try { // sm_70 and later (WMMA F16) / AMD gfx11, gfx12 (wave32
         int dev = 0, major = 0;
         dev = dpct::get_current_device_id();
         major = dpct::get_device(dev).get_major_version();
-        const char* v = std::getenv("STRATA_DS4_NO_TC");
-        return major >= 7 && !(v != nullptr && v[0] == '1');
+        // [SYCL] 同 ds4_iq.dp.cpp 的 tc_ok(): get_major_version() 解的是 OpenCL 版本串（3），
+        // sm_70 的判据恒为假 -> 显式 opt-in（STRATA_DS4_TC=1），STRATA_DS4_NO_TC=1 仍然最优先关掉
+        const char* off = std::getenv("STRATA_DS4_NO_TC");
+        const char* on = std::getenv("STRATA_DS4_TC");
+        const bool tcen = major >= 7 || (on != nullptr && on[0] == '1');
+        return tcen && !(off != nullptr && off[0] == '1');
     }();
     return ok;
 #endif
@@ -2377,7 +2402,8 @@ void set_gate_up(const x3::SetArgs &sa, const float *x, int ldx,
     const dpct::dim3 grid((unsigned)((sa.max_rows + BM - 1) / BM),
                           (unsigned)(sa.n_ff / BN), (unsigned)sa.n_exp);
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_DSV41_NO_TC)
-    if (tc_ok()) strata_ds4_launch(mx_set_tc_kernel_wrapper<true>, grid,
+    if (tc_ok() && tc_side_ok(0) && sa.max_rows >= tc_min_rows())
+        strata_ds4_launch(mx_set_tc_kernel_wrapper<true>, grid,
                                    kThreads, 0, s, k);
     else
 #elif defined(STRATA_USE_HIP)
@@ -2438,7 +2464,8 @@ void set_down(const x3::SetArgs &sa, const uint16_t *h16, int ldh, float *y,
     const dpct::dim3 grid((unsigned)((sa.max_rows + BM - 1) / BM),
                           (unsigned)(sa.n_embd / BN), (unsigned)sa.n_exp);
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_DSV41_NO_TC)
-    if (tc_ok()) strata_ds4_launch(mx_set_tc_kernel_wrapper<false>, grid,
+    if (tc_ok() && tc_side_ok(1) && sa.max_rows >= tc_min_rows())
+        strata_ds4_launch(mx_set_tc_kernel_wrapper<false>, grid,
                                    kThreads, 0, s, k);
     else
 #elif defined(STRATA_USE_HIP)

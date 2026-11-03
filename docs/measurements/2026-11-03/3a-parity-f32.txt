@@ -1,0 +1,18 @@
+IQ3_S   cpu gate_up vs ref     worst 1.93e-08 (tol 1e-05) ok
+IQ3_S   cpu down vs ref        worst 4.05e-08 (tol 1e-05) ok
+IQ3_S   cpu rows: ggml-cpu
+IQ4_XS  token gate_up          worst 6.50e-11 (tol 1e-05) ok
+IQ4_XS  token down             worst 5.02e-08 (tol 1e-06) ok
+IQ4_XS  set gate_up (f16)      worst 6.87e-04 (tol 1e-02) ok
+IQ4_XS  set down               worst 7.66e-05 (tol 3e-03) ok
+IQ4_XS  cpu gate_up vs ref     worst 2.59e-08 (tol 1e-05) ok
+IQ4_XS  cpu down vs ref        worst 3.43e-08 (tol 1e-05) ok
+IQ4_XS  cpu rows: ggml-cpu
+IQ1_M   token gate_up          worst 5.67e-08 (tol 1e-05) ok
+IQ1_M   token down             worst 4.80e-08 (tol 1e-06) ok
+IQ1_M   set gate_up (f16)      worst 8.15e-03 (tol 1e-02) ok
+IQ1_M   set down               worst 1.26e-03 (tol 3e-03) ok
+IQ1_M   cpu gate_up vs ref     worst 4.97e-08 (tol 1e-05) ok
+IQ1_M   cpu down vs ref        worst 5.10e-08 (tol 1e-05) ok
+IQ1_M   cpu rows: ggml-cpu
+ALL OK

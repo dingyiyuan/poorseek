@@ -1,0 +1,9 @@
+terminate called after throwing an instance of 'sycl::_V1::exception'
+  what():  The program was built for 1 devices
+Build program log for 'Intel(R) Arc(TM) Pro B70 Graphics':
+
+error: in function '__builtin_spriv_OpJointMatrixLoadINTEL_PackedA_RowMajor_SG16_16x16_i16_8_generic_v8i8_pi32_i32' called by kernel 'typeinfo name for void strata::ds4::gguf::iq::(anonymous namespace)::set_tc_kernel_wrapper<16, true>(strata::ds4::gguf::iq::SetArgs)::'lambda'(sycl::_V1::handler&)::operator()(sycl::_V1::handler&) const::'lambda'(sycl::_V1::nd_item<3>)': undefined reference to `__builtin_spriv_OpJointMatrixLoadINTEL_PackedA_RowMajor_SG16_16x16_i16_8_generic_v8i8_pi32_i32'
+error: backend compiler failed build.
+
+PLEASE submit a bug report to https://software.intel.com/en-us/support/priority-support and include the crash backtrace and instructions to reproduce the bug.
+PLEASE submit a bug report to https://software.intel.com/en-us/support/priority-support and include the crash backtrace and instructions to reproduce the bug.

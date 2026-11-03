@@ -1,0 +1,27 @@
+=== iq_dequant_bench（专家内核 ALU 墙）===
+blocks 131072 (33.6 M values, 8.7 MB), reps 20, batch 4, ksteps 80, groups 128
+模型：每个解出的权重被 BM=64 行复用 → 隐含 TFLOPS = Gval/s × 2 × 64 / 1000 = Gval/s × 0.128
+
+CPU ref :     520.2 ms     1.29 Gval/s     0.33 GB/s(in)
+CPU deq8:       4.7 ms     0.84 Gval/s
+SIMD vs 标量（CPU，1310720 值）: 0 处不同，max |err| = 0 (逐位一致)
+  → max err = 0，SIMD 版可以替换现有实现
+瓦片落位（CPU 模拟 256 线程 × 8 步，2560 half）: 标量存 vs 16B向量存 → 逐位一致
+CPU SIMD:       4.9 ms     0.80 Gval/s（本机 CPU 无自动向量化收益是正常的，看 GPU 那一行）
+
+device  : Intel(R) Arc(TM) Pro B70 Graphics
+GPU ref      29.61 Gval/s     7.63 GB/s(in)  隐含    3.79 TFLOPS
+GPU bat4     30.13 Gval/s     7.77 GB/s(in)  隐含    3.86 TFLOPS
+          batch speedup vs ref: 1.02x
+GPU deq8     73.93 Gval/s    19.06 GB/s(in)  隐含    9.46 TFLOPS
+GPU deq8v    73.54 Gval/s    18.96 GB/s(in)  隐含    9.41 TFLOPS
+          SIMD 版 vs 标量版: 0.99x
+tile BM64  标量      90.63 Gval/s  隐含   11.60 TFLOPS
+tile BM64  16B向量   106.21 Gval/s  隐含   13.59 TFLOPS
+tile BM64  向量+SIMD   104.04 Gval/s  隐含   13.32 TFLOPS
+          16B 向量存 vs 标量存: 1.17x   SIMD 解量化再加: 0.98x
+tile BM32  标量      48.02 Gval/s  隐含    3.07 TFLOPS
+tile BM32  向量+SIMD    52.43 Gval/s  隐含    3.36 TFLOPS
+tile BM128 向量+SIMD   182.52 Gval/s  隐含   46.72 TFLOPS
+deq8 累加 GPU vs CPU: 0 of 163840 differ, max rel err 0 (OK)
+int 码 GPU vs CPU: 0 of 33554432 differ, max |err| = 0 (OK)

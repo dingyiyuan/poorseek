@@ -1,0 +1,12 @@
+2026-11-03 09:4x, Arc Pro B70, IQ2_XXS 包, 服务端端到端（tp_ab.sh，每次提示带唯一 nonce 确保 0 reuse）
+
+base（DS4_DS4_NO_TC=1）: prompt 62290 = 0 reused + 62290 read in 165732 ms = 375.8 tok/s
+                         24 generated in 2573 ms (9.33 tok/s)
+tp  （+DS4_EXP_2PHASE=1）: prompt 62290 = 0 reused + 62290 read in 65975 ms = 944.1 tok/s
+                         24 generated in 2486 ms (9.65 tok/s)
+
+预填充 165.7s -> 66.0s，吞吐 375.8 -> 944.1 tok/s = 2.51x；wall 184.4 -> 83.8s = 2.20x
+两次输出首 48 字符完全相同（'We need respond likely summarize? The'），解码速度不受影响。
+
+（注：前两次尝试因服务端 KV/slot 缓存命中而无效——一次 62279 reused，一次清 slots 仍命中；
+最终用"每次提示加唯一 nonce"解决。）

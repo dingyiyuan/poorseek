@@ -1,0 +1,3 @@
+    tiles IQ2_XXS   6 experts x 96 rows: gate/up  9965.1 us  down  2564.2 us  ->      4 GB/s of weights, 0.02 Tw/s, 1.6 TMAC/s
+    tiles IQ2_XXS   6 experts x 256 rows: gate/up 16521.3 us  down  5064.5 us  ->      3 GB/s of weights, 0.01 Tw/s, 2.5 TMAC/s
+    tiles IQ2_XXS   6 experts x 900 rows: gate/up 58263.6 us  down 16922.3 us  ->      1 GB/s of weights, 0.00 Tw/s, 2.5 TMAC/s
