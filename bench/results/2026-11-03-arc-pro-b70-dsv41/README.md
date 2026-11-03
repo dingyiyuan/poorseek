@@ -34,6 +34,12 @@ Expert kernel alone, 900 rows/expert, 6 experts (`--bench-tiles 16 6 900`):
 | two-phase | 4,011 us | 2,054 us |
 | speedup | **14.5x** | **8.3x** |
 
+## A note on end-to-end text equality
+
+The sampler on this build is not deterministic run to run: the same configuration gives 114-117 tokens on a
+repeated greedy request. So "identical output" is not a check I can make at the text level. The correctness
+evidence is the kernel-level parity above (all seven quant types, worst 3.61e-04 against a 1e-02 tolerance).
+
 ## Why
 
 `set_gate_up`/`set_down` launch a grid of `(ceil(max_rows/64), n_ff/64, n_exp)`: every 64-row block
