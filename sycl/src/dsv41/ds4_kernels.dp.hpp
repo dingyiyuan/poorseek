@@ -32,7 +32,11 @@ constexpr size_t kv_row_bytes(int fmt, int d) {
     return fmt == kKvBf16  ? (size_t) d * 2
            : fmt == kKvFp8 ? ((size_t) d + (size_t) d / 32 + 15) / 16 * 16
            : fmt == kKvFp4 ? ((size_t) d / 2 + (size_t) d / 16 + 15) / 16 * 16
-                           : ((size_t) d / 2 + (size_t) d / 32 + 15) / 16 * 16;
+                           // the index keys (kKvFp4p) are read one 4-byte word at a time by index_score: with the
+           // rows padded only to 16 bytes (80 B at d=128) every row's 16 loads straddle sectors and none
+           // of them can be a wide load.  Padding to 32 bytes (96 B) makes the kernel 4.5x faster -
+           // measured, bit-identical: the values and the arithmetic do not change, only the stride.
+           : ((size_t) d / 2 + (size_t) d / 32 + 31) / 32 * 32;
 }
 
 /// h[t][s][e] = BF16 rows[t][e] for each of the hc streams.

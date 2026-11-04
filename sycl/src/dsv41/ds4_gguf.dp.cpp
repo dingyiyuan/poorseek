@@ -2258,6 +2258,13 @@ bool win_experts(const x3::WinArgs &a, dpct::queue_ptr s) {
     m.hq = sc->hq;
     m.hd = sc->hd;
     const int groups = a.T * a.k;   // at most (the blocks past the real count return at once)
+        // [lead] ne_max only sets the kernel's unroll step (the entry loop steps by NE), so it is always
+        // correct to lower it: a verify window's groups hold ~1.2 entries each, and NE=8 just burns registers.
+        static const int win_ne = [] { const char* v = std::getenv("DS4_WIN_NE"); return v != nullptr ? std::atoi(v) : 0; }();
+        // default 1 for a verify window (T <= 8: each group holds ~1.2 entries, and the NE=1 kernel is the
+        // decode-tuned one - measured 38.2 vs 35.8 tok/s with NE=T); DS4_WIN_NE overrides.
+        const int ne_w = win_ne > 0 ? std::min(win_ne, a.T) : (a.T <= 8 ? 1 : a.T);
+
     const bool mx = mx_experts(a.lay);
     iq::Args ia;
     if (!mx) {   // low-bit experts: ds4_iq's kernels on the same groups and scratch
@@ -2282,7 +2289,7 @@ bool win_experts(const x3::WinArgs &a, dpct::queue_ptr s) {
 #endif
             launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
     } else {
-        iq::gate_up(ia, groups, a.T, s);
+        iq::gate_up(ia, groups, ne_w, s);
     }
     q8_quant(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);   // (rows of picks not on the device: unused)
     if (mx) {
@@ -2293,7 +2300,7 @@ bool win_experts(const x3::WinArgs &a, dpct::queue_ptr s) {
 #endif
             launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
     } else {
-        iq::down(ia, groups, a.T, s);
+        iq::down(ia, groups, ne_w, s);
     }
 #if !defined(STRATA_METAL)
     // (this port's dispatches are synchronous and nothing is published to wait for: ds4_kernels.cu's wait_seq)

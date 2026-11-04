@@ -636,4 +636,6 @@ endif()
 if(TARGET strata_kernels)
   add_executable(iq_dequant_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/iq_dequant_bench.cpp)
   target_link_libraries(iq_dequant_bench PRIVATE strata_kernels)
+  # indexer 微基准：不加载模型、几秒钟出数（132K 整机一趟要 271 s，迭代太慢）
+  add_executable(index_score_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/index_score_bench.cpp)
 endif()

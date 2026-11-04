@@ -89,7 +89,8 @@ struct Stats {
     int64_t skipped = 0;              // routed experts STRATA_DS4_DISK_SKIP_W left out (light, not in RAM)
     int64_t ram_experts = 0, ram_moves = 0;   // CPU-lane experts read from the RAM tier; experts moved into it
     double prof_ms[20] = {};          // DS4_PROF: the GPU's time in decode by stage (between layers, attention, routing +
-    int64_t prof_tokens = 0;         // shared expert, experts' gate / up, the wait for the CPU lane, down + post)
+    int64_t prof_tokens = 0;
+    int64_t prof_layers = 0;   // [lead] prof marks' stage-0 count (a window run's marks are per layer, not per token)         // shared expert, experts' gate / up, the wait for the CPU lane, down + post)
     // lookahead (decode windows of one): the picks of layers guessed a layer before (the next layer's gate on this
     // layer's FFN input), of them in the guess's top k / in all its guesses / in the guess two layers before; the picks
     // read from the files, of them prefetched early; experts prefetched early

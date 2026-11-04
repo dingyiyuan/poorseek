@@ -1443,7 +1443,7 @@ struct Model::Impl {
     // DS4_PROF stages of the chunked prompt (finer ones than the decode's 0..5): 0 between layers, 1 attention rest (wq_b, wo,
     // hc_post), 2 router-side tail (shared expert), 3 experts (+ waits), 4 Engram, 5 attn mHC (mix, split, norm), 6 attention
     // projections (wq_a, wkv, compressor), 7 compressor + indexer, 8 q_b + rope, 9 sparse attention, 10 ffn mHC + router + sort
-    double cprof_ms[16] = {};
+    double cprof_ms[24] = {};
     // DS4_PROF: the experts' kernels alone, by type (events around the gate/up and down calls of run_set)
     struct EkMark {
         dpct::event_ptr e0, e1, e2;
@@ -1464,8 +1464,31 @@ struct Model::Impl {
         e = new sycl::event();
         return e;
     }
+    // [lead] DS4_TLOG host-side marks for the T>1 window path (prof_mark's own tlog only sees the T=1 stages).
+    static void tmark(int b) {
+        static const bool on = std::getenv("DS4_TLOG") != nullptr;
+        if (!on) return;
+        static double t_last = 0, acc[16] = {};
+        static long n = 0;
+        static bool reg = false;
+        if (!reg) {
+            reg = true;
+            std::atexit([] {
+                const double d = n > 0 ? (double) n : 1.0;
+                std::fprintf(stderr,
+                             "tmark per layer (%ld): wait %.2f | boundary %.2f | qkv %.2f | comp+idx %.2f | sparse %.2f | tail %.2f | "
+                             "routing %.2f | shared %.2f | rest %.2f ms\n",
+                             n, acc[13] / d, acc[12] / d, acc[8] / d, acc[9] / d, acc[10] / d, acc[11] / d, acc[4] / d,
+                             acc[6] / d + acc[7] / d + acc[2] / d, acc[3] / d);
+            });
+        }
+        const double t = now_ms();
+        if (t_last > 0.0 && b >= 0 && b < 16) acc[b] += t - t_last;
+        t_last = t;
+        if (b == 5 || b == 3) ++n;   // [lead] the else-branch end, or the async window's end
+    }
     void prof_mark(const Dev& d, int stage) {
-        if (ds4_dbg("DS4_TLOG")) {   // the host's own phase times (what the GPU meters do not see)
+        if (std::getenv("DS4_TLOG") != nullptr) {   // [lead] the host's own phase times (ds4_dbg is always false on the SYCL build)
             static double t_last = 0, acc[5] = {0, 0, 0, 0, 0}; static long n = 0; static bool reg = false;
             if (!reg) {
                 reg = true;
@@ -1534,12 +1557,17 @@ struct Model::Impl {
                 last.push_back({m.d, m.ev});
             }
         }
+        if (prof_window)   // [lead] a window run marks once a layer: count them before the marks are cleared
+            for (const ProfMark& m : prof_marks) if (m.stage == 0) ++st.prof_layers;
         for (const ProfMark& m : prof_marks) prof_pool[m.d->id].push_back(m.ev);
         prof_marks.clear();
         if (!prof_chunk) ++st.prof_tokens;
         if (!prof_chunk && st.prof_tokens % 64 == 0) {
             static long long last_w = 0; static long long last_t = 0;
             const long long nw = g_wait_seq_calls, nt2 = st.prof_tokens;
+            std::fprintf(stderr, "ds4 cpu-lane: %.2f ms/token of lane compute vs wait %.2f ms\n",
+                         st.cpu_ms / (double) (st.prof_tokens ? st.prof_tokens : 1),
+                         st.prof_ms[4] / (double) (st.prof_tokens ? st.prof_tokens : 1));
             std::fprintf(stderr, "ds4 waits: %.2f device waits/token (delta %lld over %lld tokens)\n",
                          nt2 > last_t ? (double) (nw - last_w) / (double) (nt2 - last_t) : 0.0, nw - last_w, nt2 - last_t);
             last_w = nw; last_t = nt2;   // [port] the decode stage table the CUDA build printed
@@ -1555,6 +1583,26 @@ struct Model::Impl {
                     if (sn_[i_][0] != 0)
                         std::fprintf(stderr, " %s %.2f ms", sn_[i_], st.prof_ms[i_] / (double) st.prof_tokens);
                 std::fprintf(stderr, " | total %.2f ms/token\n", tot / (double) st.prof_tokens);
+                // [lead] a window run's marks are one set a layer: the table above divides them by the token count,
+                // so it reads ~40/tokens-per-round times too large.  This line divides by the layer count instead.
+                const int64_t nl = st.prof_layers > 0 ? st.prof_layers : 1;
+                std::fprintf(stderr, "ds4 prof window per LAYER (marks %lld):", (long long) st.prof_layers);
+                for (int i_ = 0; i_ < 14; ++i_)
+                    if (sn_[i_][0] != 0)
+                        std::fprintf(stderr, " %s %.2f ms", sn_[i_], st.prof_ms[i_] / (double) nl);
+                std::fprintf(stderr, " | total %.2f ms/layer\n", tot / (double) nl);
+            }
+            // [lead] the host's own time inside the layers, against the GPU's event total above: if the host is
+            // close to the GPU's number the token is enqueue-bound (the GPU waits for launches), if it is far
+            // below it the GPU is the wall and kernel fusion buys nothing.
+            {
+                static double last_lm = 0.0, last_gw = 0.0; static long long last_t3 = 0;
+                const double dl = st.layer_ms - last_lm, dg = st.gpu_wait_ms - last_gw;
+                const long long dn = nt2 - last_t3;
+                last_lm = st.layer_ms; last_gw = st.gpu_wait_ms; last_t3 = nt2;
+                if (dn > 0)
+                    std::fprintf(stderr, "ds4 host: %.2f ms/token in the layers (routing waits %.2f ms/token)\n",
+                                 dl / (double) dn, dg / (double) dn);
             }
         }
     }
@@ -3849,7 +3897,17 @@ struct Model::Impl {
                 }
             }
             // (the indexer's slab: its scores rows are the context wide - about 64 MB of them)
-            c.AI = std::max(32, std::min(128, (int) (((size_t) 64 << 20) / (((size_t) o.max_context + 64) * 4)) / 32 * 32));
+            // [b4] the indexer's query slab.  This was a hardcoded 64 MB budget, which at max_context 393216
+            // works out to 32 queries a slab - and every slab pays one wq_b GEMM with only 32 rows (0.4 TFLOPS,
+            // 12.2% of a 132K prefill) plus one index_score launch.  DS4_IX_SLAB_MB raises it (default 64 =
+            // the old behaviour).  128 queries a slab costs 128 * (max_context+64) * 4 bytes of scores.
+            {
+                static const int mb = [] {
+                    const char* e = std::getenv("DS4_IX_SLAB_MB");
+                    return e != nullptr ? std::max(8, std::atoi(e)) : 64;
+                }();
+                c.AI = std::max(32, std::min(128, (int) (((size_t) mb << 20) / (((size_t) o.max_context + 64) * 4)) / 32 * 32));
+            }
             c.w16_elems = (size_t) 8 << 20;
             bool has_eg = false, has_first = false;
             size_t stride = 0;
@@ -5425,6 +5483,56 @@ struct Model::Impl {
             for (const Layer& l : L)
                 if (l.grp == (int) gi && !l.mtp && !l.cpu_only) want += (double) ucount(l) * l.n_exp;
             const double frac = want > 0 ? std::min(1.0, std::max(0.0, budget_t) / want) : 0.0;
+            // DS4_HEAT_BUDGET=1: 每层的槽位按 profile 的边际命中分配（可分背包贪心），而不是每层同一个比例。
+            // 集中度高的层（边际专家已经冷了）被削，分散的层（边际专家还热）被加 —— 同样的槽位覆盖更多命中。
+            static const bool heat_budget = [] {
+                const char* v = std::getenv("DS4_HEAT_BUDGET");
+                return v != nullptr && v[0] == '1';
+            }();
+            if (heat_budget) {
+                std::vector<Layer*> cand;
+                for (Layer& l : L)
+                    if (l.grp == (int) gi && !l.mtp && !l.cpu_only) { l.n_vram = 0; cand.push_back(&l); }
+                std::vector<std::vector<double>> gain(cand.size());
+                for (size_t i = 0; i < cand.size(); ++i) {
+                    const Layer& l = *cand[i];
+                    gain[i].assign((size_t) l.n_exp, 1.0);   // (no profile: uniform, the old behaviour)
+                    for (int e = 0; e < l.n_exp; ++e) {
+                        const size_t idx = (size_t) l.il * (size_t) l.n_exp + (size_t) e;
+                        if (idx < prof.size()) gain[i][(size_t) e] = (double) prof[idx] + 1.0;
+                    }
+                    std::sort(gain[i].begin(), gain[i].end(), std::greater<double>());
+                }
+                double left = budget_t;
+                while (left > 0) {
+                    int best = -1;
+                    double bestr = 0.0;
+                    for (size_t i = 0; i < cand.size(); ++i) {
+                        Layer& l = *cand[i];
+                        if (l.n_vram >= l.n_exp) continue;
+                        const double cost = (double) ucount(l);
+                        if (cost > left) continue;
+                        const double r = gain[i][(size_t) l.n_vram] / cost;
+                        if (r > bestr) { bestr = r; best = (int) i; }
+                    }
+                    if (best < 0) break;
+                    Layer& l = *cand[best];
+                    l.n_vram += 1;
+                    left -= (double) ucount(l);
+                }
+                if (o.verbose) {
+                    int lo = 0, hi = 0;
+                    for (size_t i = 0; i < cand.size(); ++i)
+                        (cand[i]->il < 20 ? lo : hi) += cand[i]->n_vram;
+                    std::fprintf(stderr, "ds4: heat budget: %d slots (L0-19 %d, L20-39 %d) of %d experts\n",
+                                 lo + hi, lo, hi, (int) (cand.size() * 384));
+                }
+                double used_h = 0;
+                for (Layer& l : L)
+                    if (l.grp == (int) gi && !l.mtp) used_h += (double) ucount(l) * l.n_vram;
+                std::fprintf(stderr, "ds4: heat budget used %.2f GB of %.2f GB\n", used_h / 1e9, budget / 1e9);
+                goto heat_done;
+            }
             for (Layer& l : L) {
                 if (l.grp != (int) gi || l.mtp) continue;
                 if (l.cpu_only) {   // (its type has no device kernel: the CPU lane reads every expert of it)
@@ -5435,6 +5543,7 @@ struct Model::Impl {
                 // never more than fits: the floor of each layer's share can still round up the total
                 while (l.n_vram > 0 && (double) ucount(l) * l.n_vram > budget) --l.n_vram;
             }
+        heat_done:
             double used = 0;
             for (Layer& l : L)
                 if (l.grp == (int) gi) used += (double) ucount(l) * l.n_vram;
@@ -7638,7 +7747,10 @@ struct Model::Impl {
     /// then not trustworthy).  Run as before, minus the unbounded spin.
     bool run_nodes(int n, const std::function<void(int)>* f) {
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->start(n, f[X]);
-        pools[0]->help();
+        // [b5] DS4_LANE_NOHELP=1: the calling thread does not join the batch.  Diagnosis only: with the
+        // host not helping, the lane's throughput has to fall with the pool's thread count if it is
+        // compute-bound, and stay put if it is a fixed hand-off latency.
+        if (std::getenv("DS4_LANE_NOHELP") == nullptr) pools[0]->help();
         bool ok = true;
         for (int X = 0; X < NH; ++X) ok = pools[(size_t) X]->wait() && ok;   // [2e16] bounded
         return ok;
@@ -8671,6 +8783,26 @@ struct Model::Impl {
             decay_tokens = 0;
             for (Layer& l : L)
                 for (float& h : l.heat) h *= c_decay;
+                // DS4_HEAT_DUMP=<path>: 运行中定期导出热度（析构不一定被调用：服务用 SIGINT 停的是 Python 包装器）
+                if (const char* hf = std::getenv("DS4_HEAT_DUMP")) {
+                    static long dump_tick = 0;
+                    if (++dump_tick % 32 == 0) {
+                        std::FILE* fp = std::fopen(hf, "wb");
+                        if (fp != nullptr) {
+                            uint64_t hn = 0;
+                            for (const Layer& l : L) {
+                                std::vector<uint32_t> row((size_t) l.n_exp, 0u);
+                                for (int e = 0; e < l.n_exp && (size_t) e < l.heat.size(); ++e) {
+                                    const double v = (double) l.heat[(size_t) e] * 1000.0;
+                                    row[(size_t) e] = v > 0 ? (uint32_t) std::llround(v) : 0u;
+                                }
+                                std::fwrite(row.data(), sizeof(uint32_t), row.size(), fp);
+                                hn += row.size();
+                            }
+                            std::fclose(fp);
+                        }
+                    }
+                }
         }
         bool queued = false, rqueued = false;
         for (Layer& l : L) {
@@ -9769,6 +9901,7 @@ struct Model::Impl {
         */
         dpct::select_device(d.id);
         dpct::queue_ptr s = d.st;
+        tmark(0);   // [lead] layer start
         prof_mark(d, 0);
         const int nm = L0.nm;
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
@@ -9913,6 +10046,7 @@ struct Model::Impl {
             }
             const int clen_max = (int) ((p0 + T) / R);
             if (l.ix_src) {
+                prof_mark(d, 14);   // [b3] indexer split: keys
                 Src& ks = srcs[(size_t) l.ik_src];
                 if (l.owns_k && ng > 0) {
                     x3::rows_f16(latent, HD, nullptr, ng, HD, c.lat16, s);
@@ -9929,10 +10063,12 @@ struct Model::Impl {
                     fi.pdst_stride = (long long) ik_rb();
                     finish(c.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
                 }
+                prof_mark(d, 15);   // [b3] indexer split: the index keys are written
                 if (clen_max > 0 && !kv_only) {
                     if (!gemm_f16w(c, l.i_wproj, g.ix_heads, D, c.x16, D, T,
                                    1.0f / std::sqrt((float) g.ix_hd) / std::sqrt((float) g.ix_heads), c.iw, 64, err))
                         return false;
+                    prof_mark(d, 16);   // [b3] indexer split: wproj done
                     for (int a0 = 0; a0 < T; a0 += c.AI) {
                         const int na = std::min(c.AI, T - a0);
                         const int64_t pa = p0 + a0;
@@ -9946,6 +10082,7 @@ struct Model::Impl {
                         fi.freqs = freqs;
                         fi.quant = 3;
                         finish(c.iq, na * g.ix_heads, g.ix_hd, g.ix_hd, fi, s);
+                        prof_mark(d, 18);   // [b3] indexer split: wq_b + finish done
                         Rows lim;
                         lim.gen = 1;
                         lim.p0 = pa;
@@ -9976,6 +10113,7 @@ struct Model::Impl {
                                             (int) cand_stride(), s);
                             }
                             topk(c.scores, ss, na, lim, nullptr, 0, 1, tk, (int) topk_stride(), s);
+                        prof_mark(d, 19);   // [b3] indexer split: score + topk done
                         }
                     }
                 }
@@ -10017,13 +10155,16 @@ struct Model::Impl {
             s->memset(c.acc, 0, (size_t)T * D * sizeof(*c.acc)))); // (no heads)
         for (int a0 = 0; a0 < T && NHL > 0; a0 += c.A) {
             const int na = std::min(c.A, T - a0);
+            prof_mark(d, 20);   // [b4] end of the previous slab's tail
             if (!gemm(d, c, l.wq_b, c.qr16 + (size_t) a0 * g.q_lora, g.q_lora, na, c.q, HQ, 0.0f, err)) return false;
+            prof_mark(d, 21);   // [b4] wq_b GEMM done
             Finish fr;
             fr.rd = g.rd;
             fr.pos = (int) (p0 + a0);
             fr.vpp = NHL;
             fr.freqs = freqs;
             finish(c.q, na * NHL, HD, HD, fr, s);
+            prof_mark(d, 22);   // [b4] q rope+quantize done
             prof_mark(d, 8);
             if (a0 == 0 && na == T) dump_sub(d, "q", l.il, p0, T, c.q, (size_t) T * HQ * 4);
             AttnRows ar;
@@ -10060,6 +10201,7 @@ struct Model::Impl {
         dump_sub(d, "h_in", l.il, p0, T, c.h, (size_t) T * H * D * 4);
         hc_post_inplace(c.acc, c.h, c.a_post, c.a_comb, D, H, T, s);
         if (dump_l != nullptr && mi == 0) dump_layer(d, c.h, 1000 + l.il, p0, T);   // (after the attention, as the window path)
+        tmark(11);   // [lead] attn tail (o_fin + wo) done
         prof_mark(d, 1);
         // the MoE
 #if defined(STRATA_METAL)
@@ -11554,12 +11696,20 @@ struct Model::Impl {
                          "(with the waits for streamed ones), between layers %.0f ms\n",
                          n, cprof_ms[1], cprof_ms[2], cprof_ms[3], cprof_ms[0]);
             {   // the finer table (ms, % of the sum)
-                static const char* nm_[16] = {"between layers", "attn rest (q_b, wo_a/b, hc_post)", "shared expert", "experts (incl waits)",
-                                              "engram", "attn mHC (mix/split/norm)", "attn projections", "compressor + indexer",
-                                              "q_b + rope", "sparse attention", "ffn mHC + router + sort", "", "", "", "", ""};
+                // 分块路径真正在打的标记是 11/12/13（11 = attn norms + qkv proj，12 = compressor + indexer，
+                // 13 = sparse attention）；0..10 那套名字与之一一对不上，保留原样以免改动既有输出。
+                static const char* nm_[24] = {"between layers", "attn rest (q_b, wo_a/b, hc_post)", "shared expert", "experts (incl waits)",
+                                              "engram", "attn mHC (mix/split/norm)", "attn projections", "compressor + indexer?",
+                                              "q_b + rope", "sparse attention?", "ffn mHC + router + sort",
+                                              "attn norms + qkv proj", "compressor + indexer (real)", "sparse attention (real)",
+                                              "  b3: compressor (compress_win)", "  b3: idx keys (wkv+finish)",
+                                              "  b3: idx wproj", "  b3: (17 unused)",
+                                              "  b3: slab wq_b+finish", "  b3: slab index_score+cand+topk",
+                                              "  b4: tail after prev mark10", "  b4: attn wq_b GEMM",
+                                              "  b4: q rope+quantize (finish)", ""};
                 double sum = 0;
                 for (double v : cprof_ms) sum += v;
-                for (int i = 0; i < 11; ++i)
+                for (int i = 0; i < 23; ++i)
                     std::fprintf(stderr, "ds4 prof  %-34s %9.1f ms %5.1f%%\n", nm_[i], cprof_ms[i], sum > 0 ? 100.0 * cprof_ms[i] / sum : 0.0);
                 struct Agg {
                     double ms = 0, flops = 0;
@@ -12429,6 +12579,7 @@ struct Model::Impl {
         hc_mix_split(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.hccnt, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps,
                      d.a_pre, d.a_post, d.a_comb, s);
 #endif
+        tmark(13);   // [lead] first submission of the layer done (the wait for the previous layer lands in 13)
         dump_sub(d, "a_mix", l.il, p0, T, d.mix, (size_t) T * 32 * 4);
         dump_sub(d, "a_pre", l.il, p0, T, d.a_pre, (size_t) T * 8 * 4);
         dump_sub(d, "a_post", l.il, p0, T, d.a_post, (size_t) T * 8 * 4);
@@ -12477,6 +12628,7 @@ struct Model::Impl {
         fk.dst_stride = HD;
         finish(d.kvr, T, HD, HD, fk, s);
         if (!l.mtp) ext_to_ring(d.ext, l.win, p0, g.win, T, HD, s, spec_win ? l.ring_bak : nullptr);
+        tmark(8);    // [lead] norms + q_a/kv done
         prof_mark(d, 11);   // [b1] attn norms + q/kv projections done
         dump_sub(d, "kv_win", l.il, p0, T, d.ext + (size_t) g.win * HD, (size_t) T * HD * 4);
         dump_sub(d, "ext", l.il, p0, T, d.ext, ((size_t) g.win + T) * HD * 2);   // (BF16 rows: the ring's, then this window's)
@@ -12663,6 +12815,7 @@ struct Model::Impl {
                 }
             }
             if (ng > 0) dump_sub(d, "latent", l.il, p0, ng, d.latent, (size_t) ng * HD * 4);
+            tmark(9);    // [lead] compressor + indexer done
             prof_mark(d, 12);   // [b1] compressor + indexer done
             dump_sub(d, "topk", l.il, p0, T, d.topk, (size_t) T * topk_stride() * 4);
             for (int t = 0; t < T; ++t) ar.nsel[t] = lim.n[t] > 0 ? wp.topk[l.il][t] : 0;
@@ -12676,6 +12829,7 @@ struct Model::Impl {
         if (NHL > 0) {
             sparse_attn(d.q, d.ext, ckv, d.topk, (int) topk_stride(), ar, l.sink, NHL, HD, T,
                         1.0f / std::sqrt((float) HD), d.o, s, ckv_fmt, 0, &d.attn_scr);
+            tmark(10);   // [lead] sparse attention done
             prof_mark(d, 13);   // [b1] sparse attention done
             dump_sub(d, "o", l.il, p0, T, d.o, (size_t) T * HQ * 4);
             Finish fo;
@@ -12715,6 +12869,7 @@ struct Model::Impl {
         dump_sub(d, "f_pre", l.il, p0, T, d.f_pre, (size_t) T * 8 * 4);
         dump_sub(d, "f_post", l.il, p0, T, d.f_post, (size_t) T * 8 * 4);
         dump_sub(d, "f_comb", l.il, p0, T, d.f_comb, (size_t) T * 64 * 4);
+        tmark(1);   // [lead] attention done
         dump_sub(d, "ffn_x", l.il, p0, T, d.x, (size_t) T * D * 4);
         if (wp.async) {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
@@ -12735,11 +12890,13 @@ struct Model::Impl {
                 route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
                 na[a - 1] = m;
             }
+            tmark(4);   // [lead] routing published (lookahead + gate + publish done)
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
                           na[1]);
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
+            tmark(6);   // [lead] routing+shared done (host)
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
             prof_mark(d, 2);
             const x3::ExpertLayout& lay = nm > 1 ? l.hlay : l.lay;
@@ -12779,17 +12936,69 @@ struct Model::Impl {
                                      t_moe_n ? t_moe_dn / (double) t_moe_n : 0.0);
                     });
                 }
+                tmark(7);   // [lead] shared -> gate/up submit
                 const double m0 = tlog2 ? now_ms() : 0.0;
                 if (mx) gg::moe_gate_up(ma, d.x, d.xg, s);
                 else x3::moe_gate_up(ma, d.x, d.xg, s);
                 const double m1 = tlog2 ? now_ms() : 0.0;
                 prof_mark(d, 3);
+                tmark(2);   // [lead] gate/up submitted (host), before the lane wait
                 if (lead && !dgpu) wait_seq(&resps[slot].seq, sq, s);   // (staged: waited for before the kernels)
                 const double m2 = tlog2 ? now_ms() : 0.0;
                 prof_mark(d, 4);
                 if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 if (tlog2) { t_moe_gu += m1 - m0; t_moe_wait += m2 - m1; t_moe_dn += now_ms() - m2; ++t_moe_n; }
+            } else if (moe_token_path && T <= 8 && [] {   // [lead] default ON: measured 37.3 vs 23.3 tok/s at 512 tokens
+                           const char* v = std::getenv("DS4_WIN_TOKEN_KERNELS");
+                           return v == nullptr || std::atoi(v) != 0;
+                       }()) {
+                // [lead] the window's experts through the token kernels (m=1 is what they are written for), one token
+                // at a time: the plan's rows are per token (route_publish writes plan[t * kPicks + r]) and the lane's
+                // answer is per token (resps[slot].part[t] / cpu[t]), so this is the T=1 block unrolled over T.
+                // [lead] each token's gate/up output is kPicks * FF apart, the plan's row block: the token kernels write
+                // h[grp * FF] for grp in [0, k) and d.xg is P = kWin * kPicks slots, so t * FF would alias the next
+                // token's region (measured: it changed the tokens on a 32-token prompt while the grouped path did not).
+                x3::MoeArgs ma;
+                ma.plan_w = d.rw;
+                ma.lay = lay;
+                ma.k = l.k_exp;
+                ma.n_embd = D;
+                ma.n_ff = FF;
+                ma.limit = g.lim;
+                const bool mx3 = lay.fmt == gg::kFmtMXFP4;
+                // [lead] DS4_WIN_TLOG: where a window layer's host time goes (ds4_dbg is constexpr false on SYCL).
+                // The token path's three spans (DS4_TLOG2) for the window: the T gate/up submits, the lane wait, the
+                // T down submits.  post (allreduce + hc_post + the f_pre copy) is the tlog's down+post span less these.
+                static const bool wt = std::getenv("DS4_WIN_TLOG") != nullptr;
+                static double wacc[3] = {0, 0, 0}; static long wn = 0; static bool wreg = false;
+                if (wt && !wreg) {
+                    wreg = true;
+                    std::atexit([] {
+                        std::fprintf(stderr, "win_tlog: %ld layers | host ms a layer: gate_up %.3f  wait %.3f  down %.3f\n",
+                                     wn, wn ? wacc[0] / (double) wn : 0.0, wn ? wacc[1] / (double) wn : 0.0,
+                                     wn ? wacc[2] / (double) wn : 0.0);
+                    });
+                }
+                const double w0 = wt ? now_ms() : 0.0;
+                for (int t = 0; t < T; ++t) {
+                    ma.plan_ptr = d.plan_ptr + (size_t) t * kPicks;
+                    ma.cpu_part = lead ? resps[slot].part[t] : nullptr;
+                    ma.cpu_flag = lead ? &resps[slot].cpu[t] : nullptr;
+                    if (mx3) gg::moe_gate_up(ma, d.x + (size_t) t * D, d.xg + (size_t) t * kPicks * FF, s);
+                    else x3::moe_gate_up(ma, d.x + (size_t) t * D, d.xg + (size_t) t * kPicks * FF, s);
+                }
+                const double w1 = wt ? now_ms() : 0.0;
+                if (lead) wait_seq(&resps[slot].seq, sq, s);
+                const double w2 = wt ? now_ms() : 0.0;
+                for (int t = 0; t < T; ++t) {
+                    ma.plan_ptr = d.plan_ptr + (size_t) t * kPicks;
+                    ma.cpu_part = lead ? resps[slot].part[t] : nullptr;
+                    ma.cpu_flag = lead ? &resps[slot].cpu[t] : nullptr;
+                    if (mx3) gg::moe_down(ma, d.xg + (size_t) t * kPicks * FF, d.sh_out + (size_t) t * D, d.moe_out + (size_t) t * D, s);
+                    else x3::moe_down(ma, d.xg + (size_t) t * kPicks * FF, d.sh_out + (size_t) t * D, d.moe_out + (size_t) t * D, s);
+                }
+                if (wt) { wacc[0] += w1 - w0; wacc[1] += w2 - w1; wacc[2] += now_ms() - w2; ++wn; }
             } else {   // each distinct expert read once for the window's tokens
                 gf::MoeWin mw;
                 mw.plan_ptr = d.plan_ptr;
@@ -12861,8 +13070,10 @@ struct Model::Impl {
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
             */
+            tmark(3);   // [lead] moe down + post submitted
             CK(DPCT_CHECK_ERROR(s->memcpy(d.pre, d.f_pre, (size_t)T * 8 * 4)));
             prof_mark(d, 5);
+            tmark(12);   // [lead] layer boundary: the f_pre copy + the stage-5 mark
             return true;
         }
         if (nm > 1) {
@@ -12873,6 +13084,7 @@ struct Model::Impl {
         static const bool phases = ds4_dbg("DS4_PHASES");   // debugging: where a decode layer's host time goes
         static double ph[8] = {0}, ph_prev = 0; static long ph_n = 0;
         const double ph0 = phases ? now_ms() : 0.0;
+        tmark(0);   // [lead] attention done
         gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
         VlBits vb = {};
         vb.w[0] = l.mtp ? 0u : wp.vl;
@@ -12884,6 +13096,7 @@ struct Model::Impl {
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
+        tmark(1);   // [lead] route done
         CK(DPCT_CHECK_ERROR(s->memcpy(h_idx, d.ridx, (size_t)T * kPicks * 4)));
         /*
         DPCT1124:536: cudaMemcpyAsync is migrated to asynchronous memcpy API.
@@ -12904,6 +13117,7 @@ struct Model::Impl {
         consumed by the program logic. This original code was replaced with 0.
         You may need to rewrite the program logic consuming the error code.
         */
+        tmark(2);   // [lead] the three D2H copies done (this is where the host waits for the layer)
         CK(DPCT_CHECK_ERROR(dpct::sync_barrier(d.ev, s)));
         // the shared expert while the host looks at the picks
         if (!mv(d, {job(l.s1, d.x, d.sg, T, D, g.ff), job(l.s3, d.x, d.su, T, D, g.ff)}, err)) return false;
@@ -13053,6 +13267,7 @@ struct Model::Impl {
               ms += now_ms() - tc; ++calls; exps += (long) ents.size();
               if (ds4_dbg("DS4_CPU_LOG") && !reg) { reg = true; std::atexit([] { std::fprintf(stderr, "cpu lane calls: %ld, experts %ld, %.1f ms (%.3f ms a call, %.3f ms an expert)%c", calls, exps, ms, ms / (double) calls, ms / (double) exps, 10); }); }
               (void) 0; (void) ms; }
+            tmark(3);   // [lead] CPU lane done
             st.cpu_ms += now_ms() - tc;
             dump_sub_host("cpu_part", l.il, p0, T, h_part, (size_t) T * D * 4);
             /*
@@ -13083,6 +13298,7 @@ struct Model::Impl {
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
+        tmark(5);   // [lead] layer done
         CK(DPCT_CHECK_ERROR(s->memcpy(d.pre, d.f_pre, (size_t)T * 8 * 4)));
         if (phases && T == 1) {
             const double ph4 = now_ms();

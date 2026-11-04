@@ -27,12 +27,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
 #include <map>
 #include <mutex>
+#include <set>
+#include <string>
 #include <unordered_map>
 
 namespace strata::ds4::gguf::iq {
@@ -2729,25 +2732,56 @@ static bool exp2p_host_bounds(dpct::queue_ptr s, const SetArgs& a, std::vector<i
     return true;
 }
 
-// 实验路径的第一原则：不许把引擎带走。任何异常都要落回融合内核，并且只提示一次。
-static void exp2p_warn(const char* what, const char* why) {
+// 实验路径的第一原则：不许把引擎带走 —— 任何异常都落回融合内核。
+// 第二原则（11-03 用一整轮换来的）：不许沉默。接管了要报，没接管更要报为什么。
+// 那次"两段式在引擎里没生效"的真实原因根本不是某个 return false，而是**跑的那份二进制里
+// 压根没有这段代码**（52443840 B / 11-02 20:30 编的，代码 11-03 09:52 才提交）。
+// 如果当初有一句 "two-phase gate/up: active"，这个结论三十秒就能拿到，而不是猜一晚上。
+static void exp2p_say(const char* tag, const char* fmt, ...) {
     static std::mutex m;
-    static bool done[2] = {false, false};
-    const int i = (what != nullptr && what[0] == 'd') ? 1 : 0;
-    std::lock_guard<std::mutex> lk(m);
-    if (done[i]) return;
-    done[i] = true;
-    std::fprintf(stderr, "two-phase %s failed (%s): falling back to the fused kernel\n", what, why);
+    static std::set<std::string> seen;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        if (!seen.insert(tag).second) return;   // 每个 tag 只说一次
+    }
+    std::fprintf(stderr, "two-phase %s: ", tag);
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    std::fputc('\n', stderr);
+}
+
+static void exp2p_warn(const char* what, const char* why) {
+    const bool down = (what != nullptr && what[0] == 'd');
+    exp2p_say(down ? "down:EXCEPTION" : "gate/up:EXCEPTION",
+              "%s --- falling back to the fused kernel", why);
 }
 
 bool set_gate_up_2ph(const SetArgs& a, dpct::queue_ptr s) {
     // iq_dequant_f16 对非 IQ 类型会 std::exit(1)：类型不对就老老实实回退，绝不能让它把引擎带走
-    if (!supported(a.tg) || a.xf == nullptr || a.idx == nullptr || a.h == nullptr) return false;
-    if (a.n_embd % 256 != 0 || a.n_ff % 256 != 0) return false;
+    if (!supported(a.tg) || a.xf == nullptr || a.idx == nullptr || a.h == nullptr) {
+        exp2p_say("gate/up:NO-TAKEOVER", "guard (type=%d supported=%d xf=%d idx=%d h=%d)", (int) a.tg,
+                  (int) supported(a.tg), (int) (a.xf != nullptr), (int) (a.idx != nullptr), (int) (a.h != nullptr));
+        return false;
+    }
+    if (a.n_embd % 256 != 0 || a.n_ff % 256 != 0) {
+        exp2p_say("gate/up:NO-TAKEOVER", "geometry n_embd=%d n_ff=%d not 256-aligned", a.n_embd, a.n_ff);
+        return false;
+    }
     TwoPhaseBuf* b = exp2p_buf(s, (size_t) a.n_embd, (size_t) a.n_ff, (size_t) std::max(1, a.max_rows));
-    if (b == nullptr) return false;
+    if (b == nullptr) {
+        exp2p_say("gate/up:NO-TAKEOVER", "scratch allocation failed (rows=%d K=%d N=%d)", a.max_rows, a.n_embd,
+                  a.n_ff);
+        return false;
+    }
     std::vector<int> hb;
-    if (!exp2p_host_bounds(s, a, hb)) return false;
+    if (!exp2p_host_bounds(s, a, hb)) {
+        exp2p_say("gate/up:NO-TAKEOVER", "bounds unavailable (bounds=%p n_exp=%d)", (const void*) a.bounds, a.n_exp);
+        return false;
+    }
+    exp2p_say("gate/up:ACTIVE", "rows=%d n_exp=%d K=%d N=%d dup=%d", a.max_rows, a.n_exp, a.n_embd, a.n_ff,
+              exp2p_dup());
     for (int e = 0; e < a.n_exp; ++e) {
         const int lo = hb[e] - a.row0, hi = hb[e + 1] - a.row0;
         const int rows = hi - lo;
@@ -2770,12 +2804,27 @@ bool set_gate_up_2ph(const SetArgs& a, dpct::queue_ptr s) {
 }
 
 bool set_down_2ph(const SetArgs& a, dpct::queue_ptr s) {
-    if (!supported(a.td) || a.xh == nullptr || a.y == nullptr) return false;
-    if (a.n_embd % 256 != 0 || a.n_ff % 256 != 0) return false;
+    if (!supported(a.td) || a.xh == nullptr || a.y == nullptr) {
+        exp2p_say("down:NO-TAKEOVER", "guard (type=%d supported=%d xh=%d y=%d)", (int) a.td, (int) supported(a.td),
+                  (int) (a.xh != nullptr), (int) (a.y != nullptr));
+        return false;
+    }
+    if (a.n_embd % 256 != 0 || a.n_ff % 256 != 0) {
+        exp2p_say("down:NO-TAKEOVER", "geometry n_embd=%d n_ff=%d not 256-aligned", a.n_embd, a.n_ff);
+        return false;
+    }
     TwoPhaseBuf* b = exp2p_buf(s, (size_t) a.n_embd, (size_t) a.n_ff, (size_t) std::max(1, a.max_rows));
-    if (b == nullptr) return false;
+    if (b == nullptr) {
+        exp2p_say("down:NO-TAKEOVER", "scratch allocation failed (rows=%d K=%d N=%d)", a.max_rows, a.n_ff, a.n_embd);
+        return false;
+    }
     std::vector<int> hb;
-    if (!exp2p_host_bounds(s, a, hb)) return false;
+    if (!exp2p_host_bounds(s, a, hb)) {
+        exp2p_say("down:NO-TAKEOVER", "bounds unavailable (bounds=%p n_exp=%d)", (const void*) a.bounds, a.n_exp);
+        return false;
+    }
+    exp2p_say("down:ACTIVE", "rows=%d n_exp=%d K=%d N=%d dup=%d", a.max_rows, a.n_exp, a.n_ff, a.n_embd,
+              exp2p_dup());
     for (int e = 0; e < a.n_exp; ++e) {
         const int lo = hb[e] - a.row0, hi = hb[e + 1] - a.row0;
         const int rows = hi - lo;
@@ -2803,6 +2852,9 @@ bool set_gate_up(const SetArgs &a, dpct::queue_ptr s) {
         } catch (...) {
             exp2p_warn("gate/up", "unknown exception");
         }
+    } else if (exp2p_on()) {
+        exp2p_say("gate/up:BELOW-MINROWS", "max_rows=%d < %d --- decode-sized set, stays fused", a.max_rows,
+                  exp2p_min_rows());
     }
 #endif
 #if defined(STRATA_METAL)
@@ -2834,6 +2886,9 @@ bool set_down(const SetArgs &a, dpct::queue_ptr s) {
         } catch (...) {
             exp2p_warn("down", "unknown exception");
         }
+    } else if (exp2p_on()) {
+        exp2p_say("down:BELOW-MINROWS", "max_rows=%d < %d --- decode-sized set, stays fused", a.max_rows,
+                  exp2p_min_rows());
     }
 #endif
 #if defined(STRATA_METAL)
