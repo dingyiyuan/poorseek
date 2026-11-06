@@ -321,3 +321,222 @@ attn proj 0.36、attn tail 0.27、between layers 0.17、sparse 0.07、comp+idx 0
 `ds4 host: 5796 ms/token`、掉崖（此时 `drm-total-vram0` 28.06 GB ≈ 剩 4.5 GB）。
 所以安全线比 §8 写的更严：**1.0 掉、0.75 掉、0.5（24 GB，剩 7 GB）不掉**。
 部署用 0.5；或者接受「长会话要定期重启」。
+
+## 15. 草稿数（`--dspark-block`）扫描：2/3/4/5（2026-11-04 19:00）
+
+默认是 pack 的 block=5 → 一轮 **T=6 窗口（1 个种子 token + 5 个草稿）**。
+`--dspark-block N` 确实生效（`max_drafts = N`，窗口 T=N+1）。同一二进制、`--profile-readonly`：
+
+**A. 退化重复 prompt（512 token，全部配置 100% 接受，唯一可比的口径）**
+
+| 草稿数 | 窗口 T | decode | verify/轮 | token/轮 |
+|---|---|---:|---:|---:|
+| 2 | 3 | 37.63 tok/s | 71.7 ms | 2.99 |
+| 3 | 4 | 41.11 tok/s | 89.1 ms | 4.00 |
+| 4 | 5 | 42.07 tok/s | 111.1 ms | 4.97 |
+| 5 | 6 | **43.44 tok/s** | 130.7 ms | 5.95 |
+
+可预测文本上草稿越多越快，但边际递减：2→3 +9.2%，3→4 +2.3%，4→5 +3.3%。
+
+**B. 真实文本（同一个 prompt，每档 4 次请求，`--vram-experts 0.5`）**
+
+| 草稿数 | decode（8 段的均值/中位） | 累计接受率 | verify/轮 |
+|---|---|---:|---:|
+| 2 | 22.2 / 23.2 | **93.2%** | 104 ms |
+| 3 | 17.9 / 18.3 | 72.3% | 112 ms |
+| 4 | 23.8 / 24.8 | 93.5% | 141 ms |
+| 5 | 22.4 / 23.8 | 84.8% | 144 ms |
+
+- 真实文本上**没有单调收益**：窗口从 104 → 144 ms 贵了 40 ms，而接受率随文本波动
+  （这档 72% 是因为那一轮生成的文本正好不可预测，每次运行生成的文本不同，所以这一列只能当参考）。
+- 结论：**可预测负载（代码/列表/结构化输出）用满 5 个草稿；真实多样文本 2–3 个就够**，
+  多出来的窗口时长换不到 token。
+- 注意 B 组是 `--vram-experts 0.5`（22 GB 左右常驻）；同一配置在 1.0 时真实文本能到 34.3 tok/s，
+  但 0.75/1.0 在长真实会话里会掉崖（§14），所以 34 那个数需要显存余量，不能当稳定值。
+
+## 16. 长会话掉速：soak 抓到的第一个确定的失效（2026-11-05 11:30）
+
+soak：`--dspark on`、`--vram-experts 1.0`、200 个真实多样请求、`DS4_PROF=1`、`DS4_RING_TLOG=1`、
+请求 <5 tok/s 即抓现场。**第 71 个请求抓到**：
+
+| 项 | 值 |
+|---|---|
+| 引擎 RSS / 显存 | **126 GB** / 30.2 GiB（满） |
+| 线程 | 61 个 `futex_do_wait` + 1 个 `hrtimer_nanosleep` |
+| 累计 `swaps` | 4557 |
+| `prof window per LAYER` | total 3.81 ms（down+post 2.44）—— **窗口本身是健康的** |
+| `dspark split` | verify 141 ms/轮，层内 135 —— **也健康** |
+| 请求速率 | 31 token / 7375 ms = **4.2 tok/s** |
+| **接受率** | 前 60 个请求累计 ~71%，最后两个请求 **`drafts 0 of 240 kept` / `0 of 135 kept`** |
+
+结论：这一次的掉速**不是**窗口变慢，而是**草稿突然全部被拒**（接受率 71% → 0），于是每轮只出 1 个 token，
+速度掉 ~6 倍。verify 每轮仍是 141 ms。
+
+**顺带否掉了一个假设**：`ring_tlog: 0 slot waits, 0 ms in all, worst 0 ms; 0 breaks` ——
+生产线程的"环形缓冲槽 2 ms 轮询"这条路**整个 soak 一次都没走到**，所以它不是原因（那个 spin 计数改动已回退）。
+
+下一步：接受率为什么突然归零。嫌疑人：drafter 与 trunk 共享的 KV/ring 状态在第 ~70 个请求后不再一致
+（`swaps 4557`、RSS 126 GB 都在这个时间点附近），或 slot 复用（`106 reused + 17 read`）在长会话里累积错位。
+
+## 17. 长会话掉速的第二种形态：GPU 侧 down+post 从 2.4 → 15.4 ms/层（2026-11-05 13:00）
+
+用 `DS4_TLOG=1` + `DS4_PROF=1` 复现（vram 1.0、3 个请求，第 3 个掉到 0.29 tok/s），抓到的分层数据：
+
+| 项 | 健康 | 掉速时 |
+|---|---|---|
+| `prof window per LAYER` total | 3.81 ms | **~17 ms**（down+post 2.44 → **15.40**） |
+| `tmark per layer` 的 host `wait` | 2.38 ms | **20.74 ms** |
+| `ds4 host` | 120 ms/token | **1923 ms/token** |
+| `cpu-lane wait` | 0.20 ms/层 | 0.81 ms/层（**很小**） |
+| `swaps` | — | 1061 → 1071 还在涨 |
+| 线程 | — | 60 futex + 1 hrtimer_nanosleep + 1 `Rl`(92% CPU，是 `serve_lane` 的空转服务循环，常态) |
+| 磁盘/读量 | — | 启动后累计 rchar 152 GB，掉速那一刻 read_bytes 不动 |
+
+**结论：这一次掉速是 GPU 侧的专家 GEMM 慢了 6 倍，主机只是在等它**（host 19xx ms/token ≈ 40 层 × 20.7 ms 的 `wait`）。
+不是主机派发、不是车道、不是磁盘；`cpu-lane wait` 只有 0.8 ms/层。和 §16 的"接受率归零"是两种不同的失效。
+
+嫌疑：`--vram-experts 1.0` 把显存钉满（剩 596 MiB）后，每层的专家要么走环形缓冲换入换出（`swaps` 持续增长），
+要么走 PCIe 暂存，专家 GEMM 就等这个搬运。下一步要量的是**每层专家搬运的字节数和耗时**（ring 换入 vs PCIe 暂存），
+以及 `--vram-experts 1.0` 与 0.5 在同一个请求上的 `swaps` 增速对比。
+
+## 18. 目标里那个 1 s/token 的车道等待，现场抓到了（2026-11-05 13:40）
+
+同一套 3 请求复现（vram 1.0、`--mmap-experts on`、`--profile-readonly`），第 1 个请求 **274 s / 47 token = 0.19 tok/s**：
+
+```
+ds4 prof decode per token (avg of 128): ... cpu-lane wait 1034.39 ms  down+post 1174.94 ms ...
+ds4 host: 4076.21 ms/token in the layers
+ds4 dspark split: verify 2309.3 | of it inside the layers 2250.0 | rest 59.3 ms/round
+ds4 dspark: 56 rounds | offered 83, accepted 42 (50.6%) | draft 229.2 ms/round, T=2 | 1.75 tokens a round
+ds4 dspark vol: swaps 345 (不变)   ← 交付里没有专家换入换出
+ds4 prof window per LAYER: total 3.50 ms/layer   ← 每层 GPU 事件完全正常
+```
+
+这就是目标里描述的那个形态，一次抓全：
+
+- **`cpu-lane wait` 1034 ms/token**（车道在等），`down+post` 1175 ms；
+- **草稿慢 30 倍**：`draft 229.2 ms/轮`（健康 7.7），`T=2`、接受率 50.6%；
+- **`swaps` 全程 345 不变** → 不是专家换入换出；
+- 每层 GPU 事件表 **3.50 ms/layer 完全正常** —— 所以"层内变慢"的解释只在某些轮次成立，这次时间花在**车道与草稿**这两处。
+
+**由此排除的假设（都是实测否掉）**：
+1. 环形槽 2 ms 轮询（`ring_tlog: 0 waits`）；
+2. 专家剖面漂移（`--expert-profile none` 与 `--profile-readonly` 表现一样：26–33 tok/s）；
+3. 显存档位阈值（`--vram-experts 0.5` 也会掉：0.26 tok/s 起手）；
+4. `swaps`/专家换入换出（掉速时 146–345，健康时 245–424，反而更少）；
+5. 磁盘/内存（掉速那刻 `read_bytes` 不动）。
+
+**剩下的唯一共同点**：车道（`serve_lane`，24 线程、专家原地读）和 drafter（GPU 小 block）**同时**慢 20–30 倍，
+而窗口的专家 GEMM 正常。两个都不碰磁盘、不碰 ring，唯一共用的资源是 **host 内存/页缓存与 PCIe**。
+下一步就量这两个：车道每个专家的耗时分解（prep/gate+up/down 已有 prof）在掉速时的值，以及 drafter 一轮里
+主机侧的每一段（`mv` 已报 15 ms/window，正常）。
+
+## 19. 长会话掉速：当前状态与可复现的夹具（2026-11-05 14:00，交接用）
+
+**症状（三种形态，都是实测抓到的）**
+1. `cpu-lane wait` 1034–2185 ms/token，同时 `draft` 慢 30×（7.7 → 229 ms/轮）、`T` 掉到 2、接受率 ~50%；
+   窗口的每层 GPU 事件仍正常（3.5 ms/层）。`swaps` 不动、磁盘 0、CPU 97% 空闲、全部线程睡 futex，
+   只有一个线程 92% CPU —— 那是 `serve_lane` 的常态空转（健康时也一样，**不是**故障信号）。
+2. 接受率突然归零：`drafts 0 of 240 kept`，每轮只出 1 token，速度掉 6×（verify 仍 141 ms/轮）。
+3. 窗口 `down+post` 2.44 → 15.40 ms/层（同一次里 `swaps` 1061→1071）。
+
+**已实测排除**：环形槽 2 ms 轮询（`ring_tlog: 0 waits`）、专家剖面漂移（`--expert-profile none` 同样健康）、
+显存档位阈值（0.5 也会掉）、`swaps`/换入换出（掉速时反而更少 146–345 vs 健康 224–445）、磁盘与内存不足。
+
+**基线（健康态，vram 1.0，3 请求 × 4 轮全绿）**：14.5–35.5 tok/s、`down+post` 1.8–3.5 ms/层、
+每请求 `swaps` 224–445。
+
+**夹具**（在 `/tmp/fix/`，重启后需重建）：
+- `repro3.py VRAM TAG [引擎参数]`：3 个真实请求，自动选空闲端口，每请求 90 s 超时，
+  打印速率 / `swaps` 增量 / `down+post` / 每层总时长；
+- `run_r5.sh`：装好 env（`DS4_PROF=1`、`R3_TIMEOUT=90`）、拿 GPU 锁、跑多轮、释放锁并恢复服务。
+  掉速大约 1/4–1/8 轮命中，所以一次要跑 4–6 轮。
+
+**下一步（未做）**：`serve_lane` 空转占满一个核 + 车道 24 线程 + drafter 抢核的**CPU 争用**假设，
+用 `--cpu-threads` 降车道线程数看低频掉速率是否下降；以及 `reqs`（64 槽）由**设备**发布、
+`serve_lane` 消费这条链在长会话里是否会出现发布/消费错位（掉速时 `cpu-lane wait` 炸掉正指向这条链）。
+
+## 20. 掉速的根因抓到了：设备把邮箱踩过一整圈，车道永远等一个被覆盖的请求（2026-11-05 20:10）
+
+**确定性复现（3 分钟，不再靠运气）**：`--cpu-threads 1` 让车道变慢，再用 `DS4_LANE_BP=0`（旧的无限背压）跑：
+
+```
+=== foff_1: --cpu-threads 1 ===
+  #1  222.7s | 47 tok   0.60 tok/s | swaps + 5 (all 5) | down+post 101.49 | total 130.05 ms/layer
+  #2..#6  STALL (>60s)     swaps 5 一直不动
+  >> lane_tlog: waiting 200 ms for request 6 in slot 6 (slot says 70)
+```
+
+`70 - 6 = 64 = kRing`：车道卡在**请求 6** 等它出现，而那个槽里已经是**请求 70**——设备越过了整整一圈，
+把车道没读过的槽覆盖了。于是：
+
+- 车道永远看不到请求 6 → 死等；
+- 解码线程等车道的答案（`cpu-lane wait` 爆炸）；
+- 专家 GEMM 等不到答案 → `down+post` 101 ms/层、`swaps` 冻结；
+- 整机 97% 空闲、所有线程睡 futex、只有一个线程空转（车道）。
+
+**这就是 §17/§18 那些形态的共同根因**：不是显存、不是磁盘、不是车道算力，是**邮箱没有背压**。
+
+**修复**（`DS4_LANE_BP`，commit `85d8f4a3`，默认开）：设备发布第 N 个请求前，必须等车道答完第 N-kRing 个
+（有界 60 s，超时明确报错）。同样条件下（`--cpu-threads 1`）BP=1 那一臂正在跑，判据：**不再出现 STALL**。
+
+### 20.1 背压修复的强制定性验证（同一 `--cpu-threads 1` 条件下 A/B）
+
+| 臂 | 请求 1 | 后续请求 | `swaps` | 结果 |
+|---|---|---|---|---|
+| `DS4_LANE_BP=0`（旧） | **222.7 s / 0.60 tok/s** | #2–#6 **全部 STALL**（>60 s） | **冻结在 5** | **永久死锁** |
+| `DS4_LANE_BP=1`（新） | **58.6 s / 5.36 tok/s** | #3 6.42、#4 2.69、#5 4.62（#2 仍超 60 s） | **297 → 1306 持续增长** | **慢但在推进** |
+
+- 旧行为：`swaps` 完全不动、`down+post` 101 ms/层、车道卡在请求 6 而槽里是 70 → 永不恢复。
+- 新行为：`swaps` 一直涨、请求能跑完；1 个车道线程本来就慢（每 token ~110 个专家串行），
+  所以 2.7–6.4 tok/s 是"车道被压到 1 线程"的合理值，**不再是死锁**。
+
+**结论：根因确认，修复有效。** 死锁 → 慢。默认 `--cpu-threads`（物理核）下车道够快，背压几乎不阻塞
+（前面 30 个请求的 A 臂就是证据：0 次掉速、15–23 tok/s）。
+
+## 20. Upstream v0.2.11 parity sweep (2026-11-06, this session)
+
+v0.2.11 released 2026-11-05 12:49Z, 24 minutes before Niko1221 closed our benchmark PR #5047
+(the results went to the website's benchmarks page, not the repository). 205 commits, 300
+files between v0.2.10 and v0.2.11. Of the nine SYCL-touching files, **one** mattered here.
+
+### Applied: Q5_0 expert dot (upstream `aa678f10`, commit `d0c4a0a0`)
+
+`vec_dot_q5_0_q8_1` in `sycl/src/kernels/cuda/iq_kernels.dp.cpp` carried the pre-0214 formula:
+the constant -16 per-weight offset was taken off the q8_1 block's `ds.y` (the sum of the
+ORIGINAL activations). Upstream changed it to multiply the sum of the QUANTIZED activations
+(`dp4a` with 0x01010101, times d8), like the Q5_1 and Q4_0 paths: `d5 * d8 * (sumi - 16 * sumu)`.
+
+Their reason: the original sum does not see the activations' rounding, which the experts'
+SwiGLU outputs (not zero-mean) make large. Whole-expert error with Q5_0 in the down projection
+was 2.1e-2 .. 3.1e-2 against 1.2e-2 for every other down type.
+
+**But the effect on this machine is zero**: the dsv41 engine's expert types are IQ1_M, IQ2_XXS,
+IQ2_XS, IQ3_XXS and IQ3_S (`sycl/src/dsv41/ds4_iq.dp.cpp:49-59`); `grep -rn "Q5_0" sycl/src/dsv41/`
+returns nothing. The fix is carried for parity with upstream, not for speed.
+
+### Not applicable
+
+- **#5086** (SYCL server `engine_args` announce signature): `sycl/serve/server_intel.py` here has
+  no `engine_args` wrapper at all, so the broken call path does not exist in this tree.
+- **#4971 / #5111** (unlisted Battlemage id counts as an Arc; an integrated GPU no longer outvotes a
+  discrete card): launcher/Control side, not in this tree.
+- Everything else in 0.2.11 is AMD 4x R9700 split engine, NVIDIA MMQ / 32768 prompt chunks,
+  FP16 weight cache, small-card layer-split walk, or Unsloth Qwen3.8 files.
+
+### Found but NOT applied: the nine Battlemage SYCL decode switches
+
+Upstream `8fffe81d` / `4a7bb1d0` turn on, by default for Battlemage devices, the measured-gain
+subset of glorysdj's PR #4185. **None of the nine exist in this tree** (`grep -rl` = 0 files for
+each of MMVQ_SHAPE_RPW, IQ2S/IQ3XXS/IQ3S_GU_ROW_REUSE, GR_LO_REUSE, ATTN_MERGE_ACTIVE,
+IQ4NL_DOWN_SLM, RESIDENT_PLAN_COMPACT, GDN_QK_REG, Q6_SHAPE_GRF, GR_REDUCE_ILP).
+
+PR #4185's own numbers, measured on **one Arc Pro B70** (the same card as here), oneAPI 2026.1,
+AOT bmg-g31, Qwen3.8 GSQ/RCO IQ3_S with streaming experts: engine decode 64.20 -> 69.70 tok/s
+(+8.57%), TPOT 15.55 -> 14.33 ms, prefill unchanged. It is a **draft with 0 comments and no move
+since 2026-10-29**, and the author states scope agreement has not been obtained.
+
+That is the one lead here big enough to matter, and it is a separate project: it needs the iq4_lut
+header (absent here), touches ~700 lines across six kernel files, and its baseline is upstream's
+Qwen path with `--stream-experts`, not this dsv41 engine. Porting it onto dsv41 has to be measured
+here, not assumed from their Qwen numbers.
