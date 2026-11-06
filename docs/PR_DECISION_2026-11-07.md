@@ -114,3 +114,32 @@ Reproduction status: reproduced locally
 issue 里**没有声称 CUDA 路径也会 stall**，而是把问题问成：设备侧发布是否被约束住了。
 
 这比原计划更值得发：如果上游设备侧没有边界，N 卡用户会遇到一模一样的症状。
+
+---
+
+## 七、#4185 移植评估：**对 dsv41 无效**（2026-11-07 06:35）
+
+移植前先查了「那些开关改的内核，dsv41 到底走不走」，答案是**不走**：
+
+```
+grep -rn "native_mmvq|fused_gr|qsa_decode_attn|verify_kernels" sycl/src/dsv41/   → 0 hits
+grep -rn "IQ3S_GU_ROW_REUSE|GR_LO_REUSE|MMVQ_SHAPE_RPW" sycl/src/               → 0 hits
+```
+
+- #4185 的 730 行全在 **Qwen 的共享内核**（`iq_kernels.dp.cpp` / `native_mmvq` / `fused_gr` /
+  `qsa_decode_attn` / `verify_kernels`）
+- **dsv41 有自己的内核**：`ds4_kernels.dp.cpp` / `ds4_iq.dp.cpp` / `expert_mmq.dp.cpp`，
+  专家 GEMM 走 `gg::moe_gate_up` / `moe_down`（`ds4_model.dp.cpp:13016`）
+- dsv41 从 `iq_kernels.hpp` 只借了 **`iq_dequant_f16` 一个函数**
+
+所以：**把 #4185 那八个开关搬过来，dsv41 一个都不会命中**，8.57% 不会跟着来。
+那个数字是 Qwen3.8 + `--stream-experts` 的，和 dsv41 的龙头路径不是同一段代码。
+
+要拿到类似的收益，得把这些优化**重新实现到 ds4_iq / expert_mmq 上**，
+那是重写而不是移植，工作量不在一个量级。
+
+### 顺带的硬事实
+
+- `pack-real` **没有 drafter**（`tensors.txt` 里 mtp/dspark 张量 0 个），
+  所以生产用 `--dspark off` 不是保守，是**没得选**
+- `pack-mtp2` 有 1244 个 drafter 张量，MTP 只能跑这个 pack
