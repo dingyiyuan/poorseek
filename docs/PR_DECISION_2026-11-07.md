@@ -96,3 +96,21 @@ Reproduction status: reproduced locally
 你的两个 PR 都没被拒绝：#5047 是结果进了官网，#4911/#150 是你自己撤的。
 现在再提 PR 的收益很低（要么重复上游已有修复，要么缺 CUDA 验证环境）；
 **真正的杠杆是把 LANE_BP 的根因作为 issue 反馈上去，以及把 #4185 那 8.57% 在 dsv41 上验证。**
+
+---
+
+## 六、已执行（2026-11-07 01:56）
+
+**Issue 已开：[Niko1221/Strata#5426](https://github.com/Niko1221/Strata/issues/5426)**
+
+标题：`[Engine] decode stall: the CPU lane waits for a request the mailbox has already overwritten (seq - next == kRing)`
+
+关键发现（开 issue 前才查清，修正了本文档第四节的假设）：上游 `src/dsv41/ds4_model.cu` 的
+`serve_lane()`（第 9390 行）**同样没有消费端背压**——它也是只等 `r.seq != next`，
+不检查设备是否越过 `kRing`。`layer_of[kRing]`（1309）、`reqs`/`resps` 按 `kRing` 分配（3739-3752）
+在两个版本里结构一致。
+
+所以这不是「我们移植引入的 bug」那么简单。但因为本机没有 NVIDIA 卡、没跑过 CUDA 版，
+issue 里**没有声称 CUDA 路径也会 stall**，而是把问题问成：设备侧发布是否被约束住了。
+
+这比原计划更值得发：如果上游设备侧没有边界，N 卡用户会遇到一模一样的症状。
