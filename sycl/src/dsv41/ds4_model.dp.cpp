@@ -4581,10 +4581,28 @@ struct Model::Impl {
         // [port] DS4_FLOW_TRACE=1: which expert slot the flow is on, and a note when a slot's last use has not
         // finished after 20 s - the shape of the stall the 4K prompt hits (a hung kernel, no output otherwise)
         const bool flow_trace = std::getenv("DS4_FLOW_TRACE") != nullptr;
+        const bool trace_items = std::getenv("DS4_FLOW_TRACE_ITEMS") != nullptr;   // [lead] one line an expert: slow
         int trace_wait_s = 0;
+        // [lead] DS4_RING_TLOG: what the producer thread spends waiting - the 2 ms poll on a ring slot's last use
+        // (it.direct) and the breaks where a slot is still being read (the else branch).  A long one here is the
+        // stall: print it as it happens (the first 20) and the totals at exit.
+        static const bool ring_tlog = std::getenv("DS4_RING_TLOG") != nullptr;
+        static std::atomic<long long> rt_n{0}, rt_ms_sum{0}, rt_ms_max{0}, rt_breaks{0};
+        static std::mutex rt_mu;
+        static bool rt_reg = false;
+        if (ring_tlog) {
+            std::lock_guard<std::mutex> lk(rt_mu);
+            if (!rt_reg) {
+                rt_reg = true;
+                std::atexit([] {
+                    std::fprintf(stderr, "ring_tlog: %lld slot waits, %.0f ms in all, worst %lld ms; %lld breaks\n",
+                                 (long long) rt_n, (double) rt_ms_sum, (long long) rt_ms_max, (long long) rt_breaks);
+                });
+            }
+        }
         while (c.n_read < end) {
             Chunk::Item& it = fit(c, c.n_read);
-            if (flow_trace)
+            if (trace_items)
                 std::fprintf(stderr, "ds4 flow: item %zu/%zu layer %d expert %d chunk %d ring %zu\n", c.n_read, end,
                              it.il, it.e, it.k, (size_t) c.ring_n), std::fflush(stderr);
             if (it.after >= 0) {   // layer-major: a slot's expert copied out of it once its reader is done; a slot
@@ -4598,7 +4616,10 @@ struct Model::Impl {
                         ++c.lc_chk;
                     wait = c.lc_chk <= (size_t) it.after;
                 }
-                if (wait) break;
+                if (wait) {
+                    if (ring_tlog) ++rt_breaks;
+                    break;
+                }
             }
             if (it.direct) {
                 const size_t R = (size_t) c.ring_n, r = c.n_read % R;
@@ -4616,7 +4637,7 @@ struct Model::Impl {
                             return v != nullptr ? std::atoi(v) : 180000;
                         }();
                         const auto t0 = std::chrono::steady_clock::now();
-                        for (;;) {   // (poll: this toolchain's sycl::event has no wait_for)
+                        for (;;) {   // (poll: this toolchain's sycl::event has no wait_for)   [lead] DS4_RING_TLOG times it
                             if (c.ring_free[r]->get_info<sycl::info::event::command_execution_status>() ==
                                 sycl::info::event_command_status::complete)
                                 break;
@@ -4629,6 +4650,17 @@ struct Model::Impl {
                             std::this_thread::sleep_for(std::chrono::milliseconds(2));
                         }
                         CK(DPCT_CHECK_ERROR(c.ring_free[r]->wait_and_throw()));
+                        if (ring_tlog) {
+                            const long long ms = (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - t0).count();
+                            ++rt_n;
+                            rt_ms_sum += ms;
+                            long long prev = rt_ms_max.load();
+                            while (ms > prev && !rt_ms_max.compare_exchange_weak(prev, ms)) {}
+                            if (ms >= 50 && rt_n.load() <= 20)
+                                std::fprintf(stderr, "ring_tlog: slot %zu waited %lld ms (item %zu, layer %d)\n",
+                                             r, ms, c.n_read, it.il), std::fflush(stderr);
+                        }
                     }
                 }
                 const Layer& l = L[(size_t) it.il];
@@ -9003,14 +9035,31 @@ struct Model::Impl {
         // and how long it waits between requests (the gap the device's pacing shows).  Off: not a clock read.
         const bool lane_log = std::getenv("DS4_HEAD_SPLIT") != nullptr;
         double t_last_pub = 0.0, t_obs = 0.0;
+        // [lead] DS4_LANE_TLOG: is the lane idle because the device never published the request it is looking for?
+        // The long-session stall shows the decode thread waiting ~1 s a token for the lane's answer while the lane's
+        // own compute counter stays small - one of the two is waiting for something that was never published.
+        static const bool lane_tlog = std::getenv("DS4_LANE_TLOG") != nullptr;
+        double t_spin = 0.0;
+        unsigned long long n_long = 0;
         while (!quit.load(std::memory_order_relaxed)) {
             Req& r = reqs[next % kRing];
             if (*(volatile unsigned*) &r.seq != next) {
+                if (lane_tlog) {
+                    if (t_spin == 0.0) t_spin = now_ms();
+                    else if (now_ms() - t_spin > 200.0 && n_long < 20) {
+                        std::fprintf(stderr, "lane_tlog: waiting %.0f ms for request %u in slot %zu (slot says %u)\n",
+                                     now_ms() - t_spin, next, (size_t) (next % kRing),
+                                     (unsigned) *(volatile unsigned*) &r.seq), std::fflush(stderr);
+                        ++n_long;
+                        t_spin = now_ms();
+                    }
+                }
                 cpu_relax();
                 if (std::chrono::steady_clock::now() - last > std::chrono::milliseconds(2))
                     std::this_thread::sleep_for(std::chrono::microseconds(20));
                 continue;
             }
+            t_spin = 0.0;
             std::atomic_thread_fence(std::memory_order_acquire);
             if (lane_log) {
                 t_obs = now_ms();
@@ -12879,6 +12928,32 @@ struct Model::Impl {
             const unsigned sq = wp.seq[l.il];
             const int slot = (int) (sq % kRing);
             const bool lead = mi == 0;
+            // [lead] DS4_LANE_BP (default on): backpressure before the device overwrites a mailbox slot.  The
+            // service thread consumes `reqs` at its own pace; once it falls a whole lap (kRing = 64 requests) behind,
+            // the publish lands on a slot it has not read yet and the request is lost - the decode thread then waits
+            // forever for an answer nobody will publish.  Measured (DS4_LANE_TLOG): "waiting 200 ms for request 10335
+            // in slot 31 (slot says 10271)" - 10335 - 10271 = 64, exactly one lap.  So: do not reuse a slot until the
+            // lane has answered the request that used it one lap ago.
+            static const bool lane_bp = [] {
+                const char* v = std::getenv("DS4_LANE_BP");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
+            if (lead && lane_bp && sq >= (unsigned) kRing) {
+                const unsigned want = sq - (unsigned) kRing;
+                if (*(volatile unsigned*) &resps[slot].seq < want) {
+                    const double t0b = now_ms();
+                    unsigned long long nb = 0;
+                    while (*(volatile unsigned*) &resps[slot].seq < want) {
+                        if ((nb++ & 4095) == 0 && now_ms() - t0b > 60000.0) {
+                            err = "layer " + std::to_string(l.il) + ": the CPU lane did not answer request " +
+                                  std::to_string(want) + " in 60 s (the device would lap the mailbox)";
+                            return false;
+                        }
+                        std::this_thread::sleep_for(std::chrono::microseconds(20));
+                    }
+                    st.lane_bp_ms += now_ms() - t0b;
+                }
+            }
             int na[2] = {0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
             for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
                 const Layer* nx = ahead_layer(L0, a);
