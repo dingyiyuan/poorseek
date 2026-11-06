@@ -540,3 +540,45 @@ That is the one lead here big enough to matter, and it is a separate project: it
 header (absent here), touches ~700 lines across six kernel files, and its baseline is upstream's
 Qwen path with `--stream-experts`, not this dsv41 engine. Porting it onto dsv41 has to be measured
 here, not assumed from their Qwen numbers.
+
+## 21. The handover's two open verifications, run on the Q5_0-carrying binary (2026-11-07 01:35-01:49)
+
+Section 20 left two checks open. Both are now measured. Config for both: pack-real,
+`--vram-experts 0.5`, `--dspark none`, `--profile-readonly`, server on 127.0.0.1:8177,
+binary `build-sycl-jit/strata-dsv41` at commit `ce4c02ee` (carries the Q5_0 change).
+
+### Accuracy: 18/24 (0.750)
+
+`tools/dsv41/iq_bench.py`, same 24 questions and the same extraction rule as every earlier run.
+Failures: #1 (empty, `got='the'`), #7 (30 -> 100), #10 (28 -> 27, off by one), #13 (Dan -> 1),
+#18 (20 -> 999), #20 (30 -> 75). The count items are the weak class: 3 of 7 wrong.
+
+Context for reading this, honestly: the historical numbers are 19/24 (MTP off) and 24/24
+(the post-LANE_BP run, a *different* configuration and not a paired A/B). 18/24 sits below both,
+but this is one sample of 24 with no paired baseline run under identical settings tonight, so it
+is not evidence that Q5_0 cost accuracy - and it cannot be, because `grep -rn "Q5_0" sycl/src/dsv41/`
+is empty, so nothing on this engine's path executes the changed function.
+
+### Rate: 24 requests x 128 tokens, all completed, median 15.22 tok/s
+
+| | value |
+|---|---|
+| completed | **24 / 24**, zero stalls |
+| min | 13.59 |
+| median | **15.22** |
+| max | 17.99 |
+| requests under 15 tok/s | 8 of 24 |
+
+The goal's bar was ">15 tok/s across 24 requests". The median clears it (15.22); the minimum
+does not (13.59), and 8 of 24 individual requests land under 15. The distribution is tight
+(13.59-17.99, a 1.32x spread) and shows no decay from first to last request, which is the part
+that matters for the stall: the 24th request ran at 14.47, in the same band as the 3rd at 13.59.
+
+### Two fixture bugs found on the way (both mine, both fixed by setting them right)
+
+1. `serve.server` needs `tokenizer`, `model_name` and `arch` in the config; a config with only
+   `exe`/`args` dies at start with "the model's tokenizer is missing".
+2. `iq_bench.py` reads its key from `DS4_API_KEY`. Without it every request returns
+   HTTP 401 in 0 s, which reads exactly like a model answering nothing: the first pass scored
+   **0/24** with an empty `got` on every row. The accuracy figure is only meaningful with
+   `DS4_API_KEY` set.
