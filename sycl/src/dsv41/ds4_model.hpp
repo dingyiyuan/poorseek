@@ -81,6 +81,7 @@ struct Stats {
     // [head-split] DS4_HEAD_SPLIT: the layers' drain before the head's kernels and the head's own wait; the CPU
     // lane's per-request latency (request seen -> answer published) and its gap (answer -> next request)
     double head_pre_ms = 0.0, head_own_ms = 0.0, lane_lat_ms = 0.0, lane_gap_ms = 0.0;
+    double lane_bp_ms = 0.0;         // waiting for the lane so the device does not lap the request mailbox
     int64_t lane_reqs = 0;
     int64_t eg_rows = 0, eg_hits = 0, eg_reads = 0;   // Engram rows asked for, served without a read, read from the files
     double eg_io_ms = 0.0;                            // the windows' Engram reads, issue to last done (mostly hidden)
